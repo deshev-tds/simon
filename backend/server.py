@@ -36,6 +36,7 @@ from kokoro_onnx import Kokoro
 SAMPLE_RATE = 16000
 TTS_SAMPLE_RATE = 24000
 DEBUG_MODE = True
+QUIET_LOGS = os.environ.get("SIMON_QUIET_LOGS") == "1"
 LM_STUDIO_URL = "http://localhost:1234/v1"
 BASE_DIR = Path(__file__).resolve().parent
 ROOT_DIR = BASE_DIR.parent
@@ -1013,7 +1014,7 @@ def tool_analyze_deep(session_id: int, instruction: str):
 
 
 def log_console(msg, type="INFO"):
-    if DEBUG_MODE:
+    if DEBUG_MODE and not QUIET_LOGS:
         timestamp = time.strftime("%H:%M:%S")
         print(f"[{timestamp}] [{type}] {msg}")
 
@@ -1048,6 +1049,8 @@ def warm_model(name: str):
 
 
 def print_perf_report(metrics):
+    if QUIET_LOGS:
+        return
     total_pipeline = metrics['end_time'] - metrics['start_time']
     C_GREEN = '\033[92m'
     C_END = '\033[0m'
@@ -1430,8 +1433,9 @@ def build_rag_context(user_text, history, memory_manager, metrics, session_id: i
 
     # Process Vector Results
     if retrieved_docs:
-        print(f"\n \033[96m[VECTOR SEARCH] Query: '{user_text}'\033[0m")
-        print(f"   \033[90m--------------------------------------------------\033[0m")
+        if not QUIET_LOGS:
+            print(f"\n \033[96m[VECTOR SEARCH] Query: '{user_text}'\033[0m")
+            print(f"   \033[90m--------------------------------------------------\033[0m")
         for i, (doc, dist, meta) in enumerate(zip(retrieved_docs, distances, metadatas)):
             score_color = '\033[92m' if dist < 0.8 else '\033[93m'
             
@@ -1440,7 +1444,8 @@ def build_rag_context(user_text, history, memory_manager, metrics, session_id: i
             src_session = meta.get("session_id", "?") if meta else "?"
             
             debug_str = f"Sess:{src_session} | {age_days:.1f}d ago"
-            print(f"    #{i+1} [{score_color}Dist: {dist:.4f}\033[0m] [{debug_str}] \033[3m\"{doc[:60]}...\"\033[0m")
+            if not QUIET_LOGS:
+                print(f"    #{i+1} [{score_color}Dist: {dist:.4f}\033[0m] [{debug_str}] \033[3m\"{doc[:60]}...\"\033[0m")
             
             if dist < RAG_THRESHOLD:
                 valid_memories.append(doc)
@@ -1451,9 +1456,11 @@ def build_rag_context(user_text, history, memory_manager, metrics, session_id: i
                     "age_days": round(age_days, 1),
                     "session": src_session
                 })
-        print(f"   \033[90m--------------------------------------------------\033[0m\n")
+        if not QUIET_LOGS:
+            print(f"   \033[90m--------------------------------------------------\033[0m\n")
     else:
-        print(f"\n \033[90m[VECTOR SEARCH] No memories found.\033[0m\n")
+        if not QUIET_LOGS:
+            print(f"\n \033[90m[VECTOR SEARCH] No memories found.\033[0m\n")
 
     anchor = history_window[:ANCHOR_MESSAGES]
     remaining = history_window[ANCHOR_MESSAGES:]
@@ -2018,7 +2025,8 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        print(f"Error: {e}")
+        if not QUIET_LOGS:
+            print(f"Error: {e}")
 
 
 if __name__ == "__main__":

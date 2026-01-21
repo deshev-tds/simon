@@ -1,66 +1,8 @@
 import json
 import queue
 import threading
-import textwrap
 
 import pytest
-
-
-TABLE_WIDTHS = {
-    "step": 24,
-    "status": 12,
-    "detail": 46,
-    "raw": 60,
-}
-
-
-def _table_line():
-    return "+" + "+".join("-" * (w + 2) for w in TABLE_WIDTHS.values()) + "+"
-
-
-def _table_print_header():
-    line = _table_line()
-    print(line, flush=True)
-    print(
-        "| {step:<{sw}} | {status:<{stw}} | {detail:<{dw}} | {raw:<{rw}} |".format(
-            step="Step",
-            status="Status",
-            detail="Detail",
-            raw="Raw Response",
-            sw=TABLE_WIDTHS["step"],
-            stw=TABLE_WIDTHS["status"],
-            dw=TABLE_WIDTHS["detail"],
-            rw=TABLE_WIDTHS["raw"],
-        ),
-        flush=True,
-    )
-    print(line, flush=True)
-
-
-def _table_print_row(step, status, detail="", raw=""):
-    step_lines = textwrap.wrap(step or "", TABLE_WIDTHS["step"]) or [""]
-    status_lines = textwrap.wrap(status or "", TABLE_WIDTHS["status"]) or [""]
-    detail_lines = textwrap.wrap(detail or "", TABLE_WIDTHS["detail"]) or [""]
-    raw_lines = textwrap.wrap(raw or "", TABLE_WIDTHS["raw"]) or [""]
-    rows = max(len(step_lines), len(status_lines), len(detail_lines), len(raw_lines))
-    for i in range(rows):
-        print(
-            "| {step:<{sw}} | {status:<{stw}} | {detail:<{dw}} | {raw:<{rw}} |".format(
-                step=step_lines[i] if i < len(step_lines) else "",
-                status=status_lines[i] if i < len(status_lines) else "",
-                detail=detail_lines[i] if i < len(detail_lines) else "",
-                raw=raw_lines[i] if i < len(raw_lines) else "",
-                sw=TABLE_WIDTHS["step"],
-                stw=TABLE_WIDTHS["status"],
-                dw=TABLE_WIDTHS["detail"],
-                rw=TABLE_WIDTHS["raw"],
-            ),
-            flush=True,
-        )
-
-
-def _table_print_footer():
-    print(_table_line(), flush=True)
 
 
 def _receive_with_timeout(ws, timeout_s):
@@ -70,7 +12,11 @@ def _receive_with_timeout(ws, timeout_s):
         try:
             q.put(ws.receive())
         except Exception as exc:
-            q.put(exc)
+            msg = str(exc)
+            if "disconnect message" in msg:
+                q.put(None)
+            else:
+                q.put(exc)
 
     thread = threading.Thread(target=_worker, daemon=True)
     thread.start()
@@ -141,10 +87,8 @@ def test_memdb_needle_rag_payload(app_client, server):
     server.RAG_THRESHOLD = 0.0
     cm = None
     try:
-        _table_print_header()
         cm, ws = _ws_connect(app_client, "/ws", timeout_s=5.0)
         session_id = _get_session_id(ws)
-        _table_print_row("connect ws", "ok", f"session_id={session_id}")
 
         needle = "TOKEN1234"
         marker = "MARKERXYZ"
@@ -167,40 +111,22 @@ def test_memdb_needle_rag_payload(app_client, server):
                 user_text = f"Seed {i} synthetic payload. Reply with exactly: OK"
             ws.send_text(user_text)
             _recv_until_done(ws)
-            if i == needle_index:
-                _table_print_row(
-                    "send needle",
-                    "ok",
-                    f"sending {needle} with {marker}",
-                    user_text,
-                )
-            if i % 10 == 0 or i == total_turns:
-                _table_print_row(
-                    "saturate context",
-                    "progress",
-                    f"sent {i}/{total_turns} messages",
-                )
 
         history = server.load_session_messages(session_id)
         assert len(history) > history_window_size
         assert len(history) > server.ANCHOR_MESSAGES + server.MAX_RECENT_MESSAGES
-        _table_print_row(
-            "context size",
-            "ok",
-            f"history={len(history)} window={history_window_size}",
-        )
 
         needle_indices = [idx for idx, msg in enumerate(history) if needle in (msg.get("content") or "")]
         assert needle_indices
         earliest = min(needle_indices)
         assert earliest >= window_first
         assert earliest < (len(history) - window_last)
-        _table_print_row("needle outside window", "ok", f"index={earliest}")
 
-        ws.send_text(
+        query = (
             f"What token was paired with {marker}? "
             "Read the recalled evidence and reply with the token only."
         )
+        ws.send_text(query)
         messages = _recv_until_done(ws)
 
         rag_msgs = [m for m in messages if m.startswith("RAG:")]
@@ -213,24 +139,31 @@ def test_memdb_needle_rag_payload(app_client, server):
                 preview_lines.extend(item["fts_preview"])
 
         assert any(needle in line for line in preview_lines), "FTS preview missing needle token."
-        _table_print_row(
-            "recall from rag",
-            "ok",
-            f"recalling {needle}",
-            rag_msgs[-1],
-        )
+        rag_hit_line = next((line for line in preview_lines if needle in line), "")
 
         ai_chunks = [m for m in messages if m.startswith("LOG:AI:")]
         ai_text = " ".join(m.split("LOG:AI:", 1)[1].strip() for m in ai_chunks)
         assert needle in ai_text
-        _table_print_row(
-            "recall from model",
-            "ok",
-            f"recalling {needle}",
-            ai_text,
+
+        with server.METRICS_LOCK:
+            last_metrics = server.METRICS_HISTORY[-1] if server.METRICS_HISTORY else {}
+        input_tokens = last_metrics.get("input_tokens", "n/a")
+
+        print(f"[INTEGRATION] tokens_sent={input_tokens}", flush=True)
+        print(
+            (
+                "[INTEGRATION] limits="
+                f"anchor={server.ANCHOR_MESSAGES} "
+                f"recent={server.MAX_RECENT_MESSAGES} "
+                f"window={history_window_size}"
+            ),
+            flush=True,
         )
+        print(f"[INTEGRATION] needle_query={query}", flush=True)
+        print(f"[INTEGRATION] rag_hit={rag_hit_line}", flush=True)
+        print(f"[INTEGRATION] model_reply={ai_text}", flush=True)
+        ws.close()
     finally:
         if cm is not None:
             cm.__exit__(None, None, None)
         server.RAG_THRESHOLD = original_threshold
-        _table_print_footer()

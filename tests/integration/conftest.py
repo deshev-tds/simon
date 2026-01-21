@@ -20,6 +20,7 @@ def server(tmp_path_factory):
     os.environ.setdefault("SIMON_DATA_DIR", str(data_dir))
     os.environ.setdefault("SIMON_RAG_DEBUG_VERBOSE", "1")
     os.environ.setdefault("SIMON_LLM_TIMEOUT_S", "10")
+    os.environ.setdefault("SIMON_QUIET_LOGS", "1")
     import backend.server as server_module
     importlib.reload(server_module)
     return server_module
