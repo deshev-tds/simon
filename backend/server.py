@@ -8,12 +8,8 @@ import soundfile as sf
 import io
 import re
 import threading
-from collections import deque
-import math
 from pathlib import Path
-import os
 import sqlite3
-import av
 import traceback
 import uuid
 import json
@@ -21,7 +17,16 @@ import shutil
 import tempfile
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
-from pydub import AudioSegment
+
+from backend.audio import (
+    _analyze_audio,
+    _convert_to_mp3_bytes,
+    _trim_old_esp_audio,
+    convert_webm_to_numpy,
+    numpy_to_wav_bytes,
+)
+from backend.config import *
+from backend.metrics import *
 
 # --- CHROMA DB & EMBEDDINGS ---
 import chromadb
@@ -32,72 +37,6 @@ from faster_whisper import WhisperModel
 from openai import OpenAI
 from kokoro_onnx import Kokoro
 
-# --- CONFIG & DEBUG ---
-SAMPLE_RATE = 16000
-TTS_SAMPLE_RATE = 24000
-DEBUG_MODE = True
-QUIET_LOGS = os.environ.get("SIMON_QUIET_LOGS") == "1"
-LM_STUDIO_URL = "http://localhost:1234/v1"
-BASE_DIR = Path(__file__).resolve().parent
-ROOT_DIR = BASE_DIR.parent
-FRONTEND_DIR = ROOT_DIR / "frontend"
-FRONTEND_PUBLIC_DIR = FRONTEND_DIR / "public"
-CERTS_DIR = ROOT_DIR / "certs"
-DATA_DIR = Path(os.environ.get("SIMON_DATA_DIR", str(BASE_DIR / "data")))
-MODELS_DIR = Path(os.environ.get("SIMON_MODELS_DIR", str(BASE_DIR / "models")))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-MODELS_DIR.mkdir(parents=True, exist_ok=True)
-ESP_AUDIO_DIR = DATA_DIR / "esp_audio"
-ESP_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-SAVE_ESP_AUDIO = True
-ESP_AUDIO_MAX_FILES = 20
-
-INDEX_HTML_PATH = FRONTEND_DIR / "index.html"
-try:
-    INDEX_HTML = INDEX_HTML_PATH.read_text(encoding="utf-8")
-except Exception:
-    INDEX_HTML = "<!doctype html><html><body><h1>Frontend not found</h1></body></html>"
-DB_PATH = DATA_DIR / "history.db"
-
-# --- MODEL CONFIG ---
-WHISPER_MODEL_NAME = "distil-medium.en"  # High-ish Accuracy
-TTS_VOICE = "am_fenrir"
-DEFAULT_LLM_MODEL = "local-model"
-
-# --- CONTEXT CONFIG ---
-MAX_RECENT_MESSAGES = 40
-ANCHOR_MESSAGES = 7
-RAG_THRESHOLD = 0.35
-
-# --- FTS5 CONFIG ---
-FTS_MAX_HITS = 5
-FTS_MIN_TOKEN_LEN = 3
-FTS_PER_SESSION = True
-FTS_DEDUP_MIN_LEN = 15
-
-def _get_int_env(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None or raw == "":
-        return default
-    try:
-        return int(raw)
-    except Exception:
-        return default
-
-MEM_SEED_LIMIT = _get_int_env("SIMON_MEM_SEED_LIMIT", 50000)
-MEM_MAX_ROWS = _get_int_env("SIMON_MEM_MAX_ROWS", MEM_SEED_LIMIT)
-MEM_PRUNE_INTERVAL_S = _get_int_env("SIMON_MEM_PRUNE_INTERVAL_S", 60)
-RAG_DEBUG_VERBOSE = _get_int_env("SIMON_RAG_DEBUG_VERBOSE", 0) > 0
-LLM_TIMEOUT_S = _get_int_env("SIMON_LLM_TIMEOUT_S", 0)
-
-# --- AGENT CONFIG (Hardened) ---
-AGENT_MAX_TURNS = 4          # Max loop iterations
-AGENT_TRIGGER_KEYWORDS = {"research", "analyze", "deep dive", "проучи", "анализирай", "deep mode"}
-MAX_TOOL_OUTPUT_CHARS = 12000 # Budget for tool returns
-
-# --- GLOBAL MODELS ---
-TEST_MODE = os.environ.get("SIMON_TEST_MODE") == "1"
-SKIP_AUDIO_MODELS = os.environ.get("SIMON_SKIP_AUDIO_MODELS") == "1"
 print("Loading AI Models... (TEST MODE)" if TEST_MODE else "Loading AI Models... (Stable Agentic Mode)")
 
 
@@ -159,97 +98,6 @@ else:
 
 current_model_lock = threading.Lock()
 current_model = DEFAULT_LLM_MODEL
-
-# --- METRICS ---
-METRICS_HISTORY = deque(maxlen=200)
-METRICS_LOCK = threading.Lock()
-
-try:
-    import tiktoken
-    _TOKEN_ENCODER = tiktoken.get_encoding("cl100k_base")
-
-    def count_tokens(text):
-        if not text:
-            return 0
-        return len(_TOKEN_ENCODER.encode(text))
-except Exception:
-    def count_tokens(text):
-        if not text:
-            return 0
-        return max(1, math.ceil(len(text) / 3))
-
-
-def init_metrics(mode, session_id):
-    return {
-        "id": str(uuid.uuid4()),
-        "mode": mode,
-        "session_id": session_id,
-        "status": "in_progress",
-        "start_time": time.time(),
-        "end_time": 0,
-        "audio_bytes": 0,
-        "audio_decode": None,
-        "stt": None,
-        "rag": 0,
-        "ctx": 0,
-        "ttft": None,
-        "llm_total": None,
-        "tts_first": None,
-        "tts_total": None,
-        "total_latency": 0,
-        "input_chars": 0,
-        "output_chars": 0,
-        "input_tokens": None,
-        "output_tokens": None,
-        "tokens_per_second": None,
-        "overhead": None,
-    }
-
-
-def _metric_value(metrics, key):
-    value = metrics.get(key)
-    if isinstance(value, (int, float)):
-        return float(value)
-    return 0.0
-
-
-def estimate_tokens_from_text(text):
-    if not text:
-        return 0
-    return count_tokens(text)
-
-
-def estimate_tokens_from_messages(messages):
-    total_tokens = 0
-    for msg in messages:
-        content = msg.get("content")
-        if isinstance(content, str):
-            total_tokens += count_tokens(content)
-    return total_tokens
-
-
-def finalize_metrics(metrics, status):
-    if metrics.get("_recorded"):
-        return
-    if not metrics.get("end_time"):
-        metrics["end_time"] = time.time()
-    metrics["status"] = status
-    metrics["total_latency"] = metrics["end_time"] - metrics["start_time"]
-    steps_total = (
-        _metric_value(metrics, "audio_decode")
-        + _metric_value(metrics, "stt")
-        + _metric_value(metrics, "rag")
-        + _metric_value(metrics, "ctx")
-        + _metric_value(metrics, "llm_total")
-    )
-    metrics["overhead"] = metrics["total_latency"] - steps_total
-    generation_time = _metric_value(metrics, "llm_total") - _metric_value(metrics, "ttft")
-    if generation_time > 0 and _metric_value(metrics, "output_tokens") > 0:
-        metrics["tokens_per_second"] = _metric_value(metrics, "output_tokens") / generation_time
-    payload = {k: v for k, v in metrics.items() if not k.startswith("_")}
-    with METRICS_LOCK:
-        METRICS_HISTORY.append(payload)
-    metrics["_recorded"] = True
 
 
 # --- SQLITE HISTORY & FTS SETUP ---
@@ -882,8 +730,6 @@ class MemoryManager:
             )
 
 
-SKIP_VECTOR_MEMORY = os.environ.get("SIMON_SKIP_VECTOR_MEMORY") == "1"
-
 if TEST_MODE or SKIP_VECTOR_MEMORY:
     class _DummyMemory:
         def search(self, *args, **kwargs):
@@ -1093,55 +939,6 @@ class ModelPayload(BaseModel):
     name: str
 
 
-def _ensure_frames_list(resampled):
-    if resampled is None:
-        return []
-    if isinstance(resampled, list):
-        return resampled
-    return [resampled]
-
-
-def convert_webm_to_numpy(webm_bytes):
-    try:
-        bio = io.BytesIO(webm_bytes)
-        container = av.open(bio, format="webm")
-        audio_stream = None
-        for s in container.streams:
-            if s.type == "audio":
-                audio_stream = s
-                break
-        if audio_stream is None:
-            return None
-
-        resampler = av.audio.resampler.AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
-        chunks = []
-        for frame in container.decode(audio_stream):
-            out_frames = _ensure_frames_list(resampler.resample(frame))
-            for of in out_frames:
-                arr = of.to_ndarray()
-                if arr.ndim == 2:
-                    arr = arr[0]
-                chunks.append(arr)
-        for of in _ensure_frames_list(resampler.resample(None)):
-            arr = of.to_ndarray()
-            if arr.ndim == 2:
-                arr = arr[0]
-            chunks.append(arr)
-        if not chunks:
-            return None
-        pcm = np.concatenate(chunks).astype(np.int16)
-        return pcm.astype(np.float32) / 32768.0
-    except Exception:
-        return None
-
-
-def numpy_to_wav_bytes(audio_np, sample_rate):
-    buffer = io.BytesIO()
-    sf.write(buffer, audio_np, sample_rate, format='WAV')
-    buffer.seek(0)
-    return buffer.read()
-
-
 def _safe_usage_dict(usage):
     if not usage:
         return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -1226,55 +1023,6 @@ def _serialize_chat_completion(model_name: str, content: str, usage=None):
             "finish_reason": "stop"
         }],
         "usage": _safe_usage_dict(usage),
-    }
-
-
-def _convert_to_mp3_bytes(samples: np.ndarray, sample_rate: int):
-    """Convert float32 mono samples to MP3 bytes using pydub/ffmpeg."""
-    audio_int16 = np.clip(samples, -1.0, 1.0)
-    audio_int16 = (audio_int16 * 32767).astype(np.int16)
-    segment = AudioSegment(
-        audio_int16.tobytes(),
-        frame_rate=sample_rate,
-        sample_width=2,
-        channels=1,
-    )
-    mp3_io = io.BytesIO()
-    segment.export(mp3_io, format="mp3", bitrate="128k")
-    mp3_io.seek(0)
-    return mp3_io
-
-
-def _trim_old_esp_audio():
-    try:
-        files = sorted(ESP_AUDIO_DIR.glob("esp_audio_*.wav"), key=lambda p: p.stat().st_mtime)
-        while len(files) > ESP_AUDIO_MAX_FILES:
-            files[0].unlink(missing_ok=True)
-            files = files[1:]
-    except Exception:
-        pass
-
-
-def _analyze_audio(audio_np: np.ndarray, sample_rate: int):
-    if audio_np is None or sample_rate <= 0:
-        return None
-    if audio_np.ndim > 1:
-        audio_np = audio_np[:, 0]
-    audio_np = audio_np.astype(np.float32)
-    peak = float(np.max(np.abs(audio_np))) if audio_np.size else 0.0
-    rms = float(np.sqrt(np.mean(np.square(audio_np)))) if audio_np.size else 0.0
-    clip_threshold = 0.98
-    clipping = float(np.mean(np.abs(audio_np) >= clip_threshold)) if audio_np.size else 0.0
-    dc_offset = float(np.mean(audio_np)) if audio_np.size else 0.0
-    duration = float(len(audio_np)) / float(sample_rate)
-    return {
-        "sample_rate": int(sample_rate),
-        "channels": 1,
-        "duration_s": round(duration, 3),
-        "peak": round(peak, 4),
-        "rms": round(rms, 4),
-        "clipping_pct": round(clipping * 100.0, 2),
-        "dc_offset": round(dc_offset, 5),
     }
 
 
