@@ -42,8 +42,8 @@ ROOT_DIR = BASE_DIR.parent
 FRONTEND_DIR = ROOT_DIR / "frontend"
 FRONTEND_PUBLIC_DIR = FRONTEND_DIR / "public"
 CERTS_DIR = ROOT_DIR / "certs"
-DATA_DIR = BASE_DIR / "data"
-MODELS_DIR = BASE_DIR / "models"
+DATA_DIR = Path(os.environ.get("SIMON_DATA_DIR", str(BASE_DIR / "data")))
+MODELS_DIR = Path(os.environ.get("SIMON_MODELS_DIR", str(BASE_DIR / "models")))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 ESP_AUDIO_DIR = DATA_DIR / "esp_audio"
@@ -93,16 +93,54 @@ AGENT_TRIGGER_KEYWORDS = {"research", "analyze", "deep dive", "проучи", "�
 MAX_TOOL_OUTPUT_CHARS = 12000 # Budget for tool returns
 
 # --- GLOBAL MODELS ---
-print("Loading AI Models... (Stable Agentic Mode)")
+TEST_MODE = os.environ.get("SIMON_TEST_MODE") == "1"
+print("Loading AI Models... (TEST MODE)" if TEST_MODE else "Loading AI Models... (Stable Agentic Mode)")
 
-# 1. STT
-stt_model = WhisperModel(WHISPER_MODEL_NAME, device="cpu", compute_type="int8")
+if TEST_MODE:
+    class _DummySTT:
+        def transcribe(self, *args, **kwargs):
+            return [], None
 
-# 2. TTS
-kokoro = Kokoro(str(MODELS_DIR / "kokoro-v0_19.onnx"), str(MODELS_DIR / "voices.bin"))
+    class _DummyTTS:
+        def create(self, text, voice=None, speed=1.0, lang=None):
+            return np.zeros(160, dtype=np.float32), SAMPLE_RATE
 
-# 3. LLM Client
-client = OpenAI(base_url=LM_STUDIO_URL, api_key="lm-studio")
+    class _DummyCompletions:
+        def create(self, *args, **kwargs):
+            msg = type("Msg", (), {"content": "", "role": "assistant", "tool_calls": None})()
+            choice = type("Choice", (), {"message": msg, "delta": type("Delta", (), {"content": ""})()})()
+            if kwargs.get("stream"):
+                def _gen():
+                    yield type("Chunk", (), {"choices": [choice]})()
+                return _gen()
+            return type("Resp", (), {"choices": [choice], "usage": None})()
+
+    class _DummyChat:
+        def __init__(self):
+            self.completions = _DummyCompletions()
+
+    class _DummyModels:
+        def list(self):
+            return type("ModelList", (), {"data": []})()
+
+    class _DummyClient:
+        def __init__(self):
+            self.chat = _DummyChat()
+            self.models = _DummyModels()
+
+    stt_model = _DummySTT()
+    kokoro = _DummyTTS()
+    client = _DummyClient()
+else:
+    # 1. STT
+    stt_model = WhisperModel(WHISPER_MODEL_NAME, device="cpu", compute_type="int8")
+
+    # 2. TTS
+    kokoro = Kokoro(str(MODELS_DIR / "kokoro-v0_19.onnx"), str(MODELS_DIR / "voices.bin"))
+
+    # 3. LLM Client
+    client = OpenAI(base_url=LM_STUDIO_URL, api_key="lm-studio")
+
 current_model_lock = threading.Lock()
 current_model = DEFAULT_LLM_MODEL
 
@@ -287,22 +325,23 @@ def _ensure_fts5(conn: sqlite3.Connection):
         )
     """)
 
+    conn.execute("DROP TRIGGER IF EXISTS messages_ai")
+    conn.execute("DROP TRIGGER IF EXISTS messages_ad")
+    conn.execute("DROP TRIGGER IF EXISTS messages_au")
     conn.execute("""
-        CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+        CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
             INSERT INTO messages_fts(rowid, content, session_id, role)
             VALUES (new.id, new.content, new.session_id, new.role);
         END;
     """)
     conn.execute("""
-        CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
-            INSERT INTO messages_fts(messages_fts, rowid, content, session_id, role)
-            VALUES('delete', old.id, old.content, old.session_id, old.role);
+        CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
+            DELETE FROM messages_fts WHERE rowid = old.id;
         END;
     """)
     conn.execute("""
-        CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE OF content, session_id, role ON messages BEGIN
-            INSERT INTO messages_fts(messages_fts, rowid, content, session_id, role)
-            VALUES('delete', old.id, old.content, old.session_id, old.role);
+        CREATE TRIGGER messages_au AFTER UPDATE OF content, session_id, role ON messages BEGIN
+            DELETE FROM messages_fts WHERE rowid = old.id;
             INSERT INTO messages_fts(rowid, content, session_id, role)
             VALUES (new.id, new.content, new.session_id, new.role);
         END;
@@ -426,12 +465,19 @@ def seed_mem_db_from_disk(disk_conn, mem_conn, limit=MEM_SEED_LIMIT, batch_size=
             pass
 
 
-def prune_mem_db(mem_conn, max_rows=MEM_MAX_ROWS, interval_s=MEM_PRUNE_INTERVAL_S):
+def prune_mem_db(mem_conn, max_rows=MEM_MAX_ROWS, interval_s=MEM_PRUNE_INTERVAL_S, stop_event=None):
     if max_rows <= 0:
         return
-    interval_s = max(5, interval_s)
+    if TEST_MODE:
+        interval_s = max(1, interval_s)
+    else:
+        interval_s = max(5, interval_s)
     while True:
+        if stop_event is not None and stop_event.is_set():
+            break
         time.sleep(interval_s)
+        if stop_event is not None and stop_event.is_set():
+            break
         try:
             with db_lock:
                 cur = mem_conn.execute("SELECT COUNT(1) FROM messages")
@@ -455,17 +501,32 @@ def prune_mem_db(mem_conn, max_rows=MEM_MAX_ROWS, interval_s=MEM_PRUNE_INTERVAL_
 
 
 mem_conn = init_mem_db()
-_mem_seed_cutoff = time.time()
-threading.Thread(
-    target=seed_mem_db_from_disk,
-    args=(db_conn, mem_conn, MEM_SEED_LIMIT, 1000, _mem_seed_cutoff),
-    daemon=True
-).start()
-threading.Thread(
-    target=prune_mem_db,
-    args=(mem_conn, MEM_MAX_ROWS, MEM_PRUNE_INTERVAL_S),
-    daemon=True
-).start()
+_mem_threads_started = False
+
+
+def start_mem_threads(stop_event=None):
+    global _mem_threads_started
+    if _mem_threads_started:
+        return None
+    _mem_threads_started = True
+    _mem_seed_cutoff = time.time()
+    seed_thread = threading.Thread(
+        target=seed_mem_db_from_disk,
+        args=(db_conn, mem_conn, MEM_SEED_LIMIT, 1000, _mem_seed_cutoff),
+        daemon=True
+    )
+    prune_thread = threading.Thread(
+        target=prune_mem_db,
+        args=(mem_conn, MEM_MAX_ROWS, MEM_PRUNE_INTERVAL_S, stop_event),
+        daemon=True
+    )
+    seed_thread.start()
+    prune_thread.start()
+    return seed_thread, prune_thread
+
+
+if not TEST_MODE:
+    start_mem_threads()
 
 
 def create_session(title=None, model=None, summary=None, tags=None):
@@ -663,7 +724,7 @@ def fts_search_messages(
     limit: int = FTS_MAX_HITS,
     cutoff_ts: float | None = None,
     conn: sqlite3.Connection | None = None,
-    lock: threading.Lock | None = None,
+    lock=None,
 ):
     # Strategy 1: AND query (strict)
     q = _fts_sanitize_query(query_text, " ")
@@ -805,7 +866,17 @@ class MemoryManager:
             )
 
 
-memory = MemoryManager()
+if TEST_MODE:
+    class _DummyMemory:
+        def search(self, *args, **kwargs):
+            return [], [], []
+
+        def save(self, *args, **kwargs):
+            return None
+
+    memory = _DummyMemory()
+else:
+    memory = MemoryManager()
 print("All Models Loaded.")
 
 
