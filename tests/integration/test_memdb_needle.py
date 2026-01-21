@@ -98,7 +98,7 @@ def test_memdb_needle_rag_payload(app_client, server):
             window_first + window_last,
             server.ANCHOR_MESSAGES + server.MAX_RECENT_MESSAGES
         )
-        total_turns = max(30, (history_window_size // 2) + 6)
+        total_turns = max(60, history_window_size)
         needle_index = max(12, total_turns // 2)
 
         for i in range(1, total_turns + 1):
@@ -115,6 +115,7 @@ def test_memdb_needle_rag_payload(app_client, server):
         history = server.load_session_messages(session_id)
         assert len(history) > history_window_size
         assert len(history) > server.ANCHOR_MESSAGES + server.MAX_RECENT_MESSAGES
+        assert len(history) >= history_window_size * 2
 
         needle_indices = [idx for idx, msg in enumerate(history) if needle in (msg.get("content") or "")]
         assert needle_indices
@@ -126,6 +127,29 @@ def test_memdb_needle_rag_payload(app_client, server):
             f"What token was paired with {marker}? "
             "Read the recalled evidence and reply with the token only."
         )
+        metrics = server.init_metrics("text", session_id)
+        context_msgs, _ = server.build_rag_context(
+            query,
+            history,
+            server.memory,
+            metrics,
+            session_id,
+        )
+        non_system_msgs = [m for m in context_msgs if m.get("role") != "system"]
+        assert len(non_system_msgs) <= (window_first + window_last)
+        assert all(needle not in (m.get("content") or "") for m in non_system_msgs)
+
+        purge_resp = app_client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [
+                    {"role": "system", "content": "Reset any prior context."},
+                    {"role": "user", "content": "OK"},
+                ],
+                "temperature": 0.0,
+            },
+        )
+        assert purge_resp.status_code == 200
         ws.send_text(query)
         messages = _recv_until_done(ws)
 
