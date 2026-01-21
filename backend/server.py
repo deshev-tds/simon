@@ -72,6 +72,7 @@ FTS_MAX_HITS = 5
 FTS_MIN_TOKEN_LEN = 3
 FTS_PER_SESSION = True
 FTS_DEDUP_MIN_LEN = 15
+MEM_SEED_LIMIT = 50000
 
 # --- AGENT CONFIG (Hardened) ---
 AGENT_MAX_TURNS = 4          # Max loop iterations
@@ -315,6 +316,112 @@ except Exception as _e:
         print(f"[WARN] FTS5 setup failed: {_e}")
 
 
+def init_mem_db():
+    conn = sqlite3.connect(
+        "file:memdb?mode=memory&cache=shared",
+        uri=True,
+        check_same_thread=False
+    )
+    conn.execute("PRAGMA foreign_keys = OFF;")
+    conn.execute("PRAGMA journal_mode=MEMORY;")
+    conn.execute("PRAGMA synchronous=OFF;")
+    conn.execute("PRAGMA busy_timeout=5000;")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            summary TEXT DEFAULT '',
+            tags TEXT DEFAULT '',
+            model TEXT,
+            metadata TEXT,
+            created_at REAL DEFAULT (strftime('%s','now')),
+            updated_at REAL DEFAULT (strftime('%s','now'))
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            tokens INTEGER DEFAULT 0,
+            audio_path TEXT,
+            created_at REAL DEFAULT (strftime('%s','now')),
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_session_created ON messages(session_id, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC)")
+
+    conn.commit()
+    try:
+        _ensure_fts5(conn)
+    except Exception as _e:
+        if DEBUG_MODE:
+            print(f"[WARN] In-memory FTS5 setup failed: {_e}")
+    return conn
+
+
+def seed_mem_db_from_disk(disk_conn, mem_conn, limit=MEM_SEED_LIMIT, batch_size=1000, cutoff_ts=None):
+    if limit <= 0:
+        return
+    ro_conn = None
+    try:
+        ro_conn = sqlite3.connect(
+            f"file:{DB_PATH}?mode=ro",
+            uri=True,
+            check_same_thread=False
+        )
+        ro_conn.execute("PRAGMA busy_timeout=5000;")
+        params = []
+        sql = """
+            SELECT session_id, role, content, tokens, audio_path, created_at
+            FROM messages
+        """
+        if cutoff_ts is not None:
+            sql += " WHERE created_at <= ?"
+            params.append(float(cutoff_ts))
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(int(limit))
+
+        rows = ro_conn.execute(sql, tuple(params)).fetchall()
+        if not rows:
+            return
+        rows = list(reversed(rows))
+        if DEBUG_MODE:
+            print(f"[MEM] Seeding in-memory FTS with {len(rows)} rows...")
+
+        for i in range(0, len(rows), batch_size):
+            chunk = rows[i:i + batch_size]
+            with db_lock:
+                mem_conn.executemany(
+                    "INSERT INTO messages(session_id, role, content, tokens, audio_path, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    chunk
+                )
+                mem_conn.commit()
+        if DEBUG_MODE:
+            print("[MEM] In-memory FTS seed complete.")
+    except Exception as _e:
+        if DEBUG_MODE:
+            print(f"[WARN] In-memory FTS seed failed: {_e}")
+    finally:
+        try:
+            if ro_conn:
+                ro_conn.close()
+        except Exception:
+            pass
+
+
+mem_conn = init_mem_db()
+_mem_seed_cutoff = time.time()
+threading.Thread(
+    target=seed_mem_db_from_disk,
+    args=(db_conn, mem_conn, MEM_SEED_LIMIT, 1000, _mem_seed_cutoff),
+    daemon=True
+).start()
+
+
 def create_session(title=None, model=None, summary=None, tags=None):
     ts = time.time()
     with db_lock:
@@ -426,6 +533,19 @@ def save_interaction(session_id, user_text, ai_text):
         )
         db_conn.execute("UPDATE sessions SET updated_at=? WHERE id=?", (ts, session_id))
         db_conn.commit()
+        try:
+            mem_conn.execute(
+                "INSERT INTO messages(session_id, role, content, tokens, created_at) VALUES (?, ?, ?, ?, ?)",
+                (session_id, "user", user_text, 0, ts)
+            )
+            mem_conn.execute(
+                "INSERT INTO messages(session_id, role, content, tokens, created_at) VALUES (?, ?, ?, ?, ?)",
+                (session_id, "assistant", ai_text, 0, ts)
+            )
+            mem_conn.commit()
+        except Exception as _e:
+            if DEBUG_MODE:
+                print(f"[WARN] In-memory DB insert failed: {_e}")
 
 
 def set_session_title(session_id, title):
@@ -496,6 +616,8 @@ def fts_search_messages(
     session_id: int | None = None,
     limit: int = FTS_MAX_HITS,
     cutoff_ts: float | None = None,
+    conn: sqlite3.Connection | None = None,
+    lock: threading.Lock | None = None,
 ):
     # Strategy 1: AND query (strict)
     q = _fts_sanitize_query(query_text, " ")
@@ -520,8 +642,10 @@ def fts_search_messages(
         params.append(int(max(1, min(limit, 50))))
         
         try:
-            with db_lock:
-                return db_conn.execute(sql, tuple(params)).fetchall()
+            target_conn = conn or db_conn
+            target_lock = lock or db_lock
+            with target_lock:
+                return target_conn.execute(sql, tuple(params)).fetchall()
         except Exception:
             return []
 
@@ -700,7 +824,14 @@ def tool_search_memory(query: str, scope: str = "recent", session_id: int = None
     fts_res = []
     if scope in ["recent", "session"]:
         target_sess = session_id if scope == "session" else None
-        fts_res = fts_search_messages(query, session_id=target_sess, limit=3, cutoff_ts=cutoff_ts)
+        fts_res = fts_search_messages(
+            query,
+            session_id=target_sess,
+            limit=3,
+            cutoff_ts=cutoff_ts,
+            conn=mem_conn,
+            lock=db_lock,
+        )
 
     results = []
     # Format output (capped)
@@ -1147,7 +1278,13 @@ def build_rag_context(user_text, history, memory_manager, metrics, session_id: i
     # 2) SQLite FTS5 keyword recall
     fts_hits = []
     try:
-        fts_hits = fts_search_messages(user_text, session_id=session_id, limit=FTS_MAX_HITS)
+        fts_hits = fts_search_messages(
+            user_text,
+            session_id=session_id,
+            limit=FTS_MAX_HITS,
+            conn=mem_conn,
+            lock=db_lock,
+        )
     except Exception:
         fts_hits = []
 
