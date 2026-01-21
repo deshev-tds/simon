@@ -86,6 +86,8 @@ def _get_int_env(name: str, default: int) -> int:
 MEM_SEED_LIMIT = _get_int_env("SIMON_MEM_SEED_LIMIT", 50000)
 MEM_MAX_ROWS = _get_int_env("SIMON_MEM_MAX_ROWS", MEM_SEED_LIMIT)
 MEM_PRUNE_INTERVAL_S = _get_int_env("SIMON_MEM_PRUNE_INTERVAL_S", 60)
+RAG_DEBUG_VERBOSE = _get_int_env("SIMON_RAG_DEBUG_VERBOSE", 0) > 0
+LLM_TIMEOUT_S = _get_int_env("SIMON_LLM_TIMEOUT_S", 0)
 
 # --- AGENT CONFIG (Hardened) ---
 AGENT_MAX_TURNS = 4          # Max loop iterations
@@ -94,52 +96,65 @@ MAX_TOOL_OUTPUT_CHARS = 12000 # Budget for tool returns
 
 # --- GLOBAL MODELS ---
 TEST_MODE = os.environ.get("SIMON_TEST_MODE") == "1"
+SKIP_AUDIO_MODELS = os.environ.get("SIMON_SKIP_AUDIO_MODELS") == "1"
 print("Loading AI Models... (TEST MODE)" if TEST_MODE else "Loading AI Models... (Stable Agentic Mode)")
 
+
+class _DummySTT:
+    def transcribe(self, *args, **kwargs):
+        return [], None
+
+
+class _DummyTTS:
+    def create(self, text, voice=None, speed=1.0, lang=None):
+        return np.zeros(160, dtype=np.float32), SAMPLE_RATE
+
+
+class _DummyCompletions:
+    def create(self, *args, **kwargs):
+        msg = type("Msg", (), {"content": "", "role": "assistant", "tool_calls": None})()
+        choice = type("Choice", (), {"message": msg, "delta": type("Delta", (), {"content": ""})()})()
+        if kwargs.get("stream"):
+            def _gen():
+                yield type("Chunk", (), {"choices": [choice]})()
+            return _gen()
+        return type("Resp", (), {"choices": [choice], "usage": None})()
+
+
+class _DummyChat:
+    def __init__(self):
+        self.completions = _DummyCompletions()
+
+
+class _DummyModels:
+    def list(self):
+        return type("ModelList", (), {"data": []})()
+
+
+class _DummyClient:
+    def __init__(self):
+        self.chat = _DummyChat()
+        self.models = _DummyModels()
+
+
 if TEST_MODE:
-    class _DummySTT:
-        def transcribe(self, *args, **kwargs):
-            return [], None
-
-    class _DummyTTS:
-        def create(self, text, voice=None, speed=1.0, lang=None):
-            return np.zeros(160, dtype=np.float32), SAMPLE_RATE
-
-    class _DummyCompletions:
-        def create(self, *args, **kwargs):
-            msg = type("Msg", (), {"content": "", "role": "assistant", "tool_calls": None})()
-            choice = type("Choice", (), {"message": msg, "delta": type("Delta", (), {"content": ""})()})()
-            if kwargs.get("stream"):
-                def _gen():
-                    yield type("Chunk", (), {"choices": [choice]})()
-                return _gen()
-            return type("Resp", (), {"choices": [choice], "usage": None})()
-
-    class _DummyChat:
-        def __init__(self):
-            self.completions = _DummyCompletions()
-
-    class _DummyModels:
-        def list(self):
-            return type("ModelList", (), {"data": []})()
-
-    class _DummyClient:
-        def __init__(self):
-            self.chat = _DummyChat()
-            self.models = _DummyModels()
-
     stt_model = _DummySTT()
     kokoro = _DummyTTS()
     client = _DummyClient()
 else:
-    # 1. STT
-    stt_model = WhisperModel(WHISPER_MODEL_NAME, device="cpu", compute_type="int8")
+    if SKIP_AUDIO_MODELS:
+        stt_model = _DummySTT()
+        kokoro = _DummyTTS()
+    else:
+        # 1. STT
+        stt_model = WhisperModel(WHISPER_MODEL_NAME, device="cpu", compute_type="int8")
 
-    # 2. TTS
-    kokoro = Kokoro(str(MODELS_DIR / "kokoro-v0_19.onnx"), str(MODELS_DIR / "voices.bin"))
+        # 2. TTS
+        kokoro = Kokoro(str(MODELS_DIR / "kokoro-v0_19.onnx"), str(MODELS_DIR / "voices.bin"))
 
     # 3. LLM Client
-    client = OpenAI(base_url=LM_STUDIO_URL, api_key="lm-studio")
+    llm_timeout = LLM_TIMEOUT_S if LLM_TIMEOUT_S > 0 else None
+    client = OpenAI(base_url=LM_STUDIO_URL, api_key="lm-studio", timeout=llm_timeout)
 
 current_model_lock = threading.Lock()
 current_model = DEFAULT_LLM_MODEL
@@ -866,7 +881,9 @@ class MemoryManager:
             )
 
 
-if TEST_MODE:
+SKIP_VECTOR_MEMORY = os.environ.get("SIMON_SKIP_VECTOR_MEMORY") == "1"
+
+if TEST_MODE or SKIP_VECTOR_MEMORY:
     class _DummyMemory:
         def search(self, *args, **kwargs):
             return [], [], []
@@ -1493,6 +1510,9 @@ def build_rag_context(user_text, history, memory_manager, metrics, session_id: i
                     "(Treat as raw evidence; reconcile with the current turn.)"
                 )
             })
+
+        if RAG_DEBUG_VERBOSE and final_fts_lines:
+            rag_payload.append({"fts_preview": final_fts_lines[:FTS_MAX_HITS]})
 
         try:
             rag_payload.append({"fts_hits": len(fts_hits), "deduplicated": dedup_count})

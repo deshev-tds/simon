@@ -124,7 +124,34 @@ The TTS endpoint (`speech_endpoint`) attempts MP3 conversion first. If it throws
 
 ---
 
-## 6. Conclusion
+## 6. Testing (Unit + Integration)
+
+Unit tests exercise the API, WebSocket flows, memdb seed/prune, and FTS retrieval. Integration tests run against a live LM Studio server (no model mocks) and verify that long context oversaturation still allows a "needle" token to be recalled via memdb and confirmed in the model response.
+
+**Run the suites:**
+* `tests/run_tests.sh` (unit)
+* `tests/run_tests.sh --integration` (integration, requires LM Studio at `http://localhost:1234/v1`)
+* `tests/run_tests.sh --all`
+
+**Needle recall integration test (excerpt):**
+
+```python
+# tests/integration/test_memdb_needle.py
+needle = "TOKEN1234"
+marker = "MARKERXYZ"
+
+ws.send_text(f"Seed {i} {marker} {needle} synthetic payload. Reply with exactly: OK")
+...
+ws.send_text(f"What token was paired with {marker}? Read the recalled evidence and reply with the token only.")
+messages = _recv_until_done(ws)
+
+assert any(needle in line for line in preview_lines)  # memdb/FTS recall via RAG payload
+assert needle in ai_text  # model confirms the recalled token
+```
+
+---
+
+## 7. Conclusion
 
 This project demonstrates that enterprise-grade AI architecture—specifically the **Recursive Agentic patterns** utilized by top research labs—can be successfully implemented in a resource-constrained, local environment. By carefully managing context, enforcing thread safety, and enabling the model to "think" before it speaks, Simon represents the next generation of personal voice assistants.
 
