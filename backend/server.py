@@ -11,6 +11,7 @@ import threading
 from collections import deque
 import math
 from pathlib import Path
+import os
 import sqlite3
 import av
 import traceback
@@ -72,7 +73,19 @@ FTS_MAX_HITS = 5
 FTS_MIN_TOKEN_LEN = 3
 FTS_PER_SESSION = True
 FTS_DEDUP_MIN_LEN = 15
-MEM_SEED_LIMIT = 50000
+
+def _get_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+MEM_SEED_LIMIT = _get_int_env("SIMON_MEM_SEED_LIMIT", 50000)
+MEM_MAX_ROWS = _get_int_env("SIMON_MEM_MAX_ROWS", MEM_SEED_LIMIT)
+MEM_PRUNE_INTERVAL_S = _get_int_env("SIMON_MEM_PRUNE_INTERVAL_S", 60)
 
 # --- AGENT CONFIG (Hardened) ---
 AGENT_MAX_TURNS = 4          # Max loop iterations
@@ -413,11 +426,44 @@ def seed_mem_db_from_disk(disk_conn, mem_conn, limit=MEM_SEED_LIMIT, batch_size=
             pass
 
 
+def prune_mem_db(mem_conn, max_rows=MEM_MAX_ROWS, interval_s=MEM_PRUNE_INTERVAL_S):
+    if max_rows <= 0:
+        return
+    interval_s = max(5, interval_s)
+    while True:
+        time.sleep(interval_s)
+        try:
+            with db_lock:
+                cur = mem_conn.execute("SELECT COUNT(1) FROM messages")
+                count = cur.fetchone()[0] or 0
+                if count <= max_rows:
+                    continue
+                cutoff_row = mem_conn.execute(
+                    "SELECT id FROM messages ORDER BY id DESC LIMIT 1 OFFSET ?",
+                    (max_rows - 1,)
+                ).fetchone()
+                if not cutoff_row:
+                    continue
+                cutoff_id = cutoff_row[0]
+                mem_conn.execute("DELETE FROM messages WHERE id < ?", (cutoff_id,))
+                mem_conn.commit()
+            if DEBUG_MODE:
+                print(f"[MEM] Pruned in-memory FTS to {max_rows} rows.")
+        except Exception as _e:
+            if DEBUG_MODE:
+                print(f"[WARN] In-memory FTS prune failed: {_e}")
+
+
 mem_conn = init_mem_db()
 _mem_seed_cutoff = time.time()
 threading.Thread(
     target=seed_mem_db_from_disk,
     args=(db_conn, mem_conn, MEM_SEED_LIMIT, 1000, _mem_seed_cutoff),
+    daemon=True
+).start()
+threading.Thread(
+    target=prune_mem_db,
+    args=(mem_conn, MEM_MAX_ROWS, MEM_PRUNE_INTERVAL_S),
     daemon=True
 ).start()
 
