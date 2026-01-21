@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Simon Admin Metrics</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --border: rgba(0, 0, 0, 0.2);
+        --header: rgba(0, 0, 0, 0.06);
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --border: rgba(255, 255, 255, 0.2);
+          --header: rgba(255, 255, 255, 0.08);
+        }
+      }
+      body {
+        margin: 16px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        font-size: 13px;
+        line-height: 1.4;
+        background: Canvas;
+        color: CanvasText;
+      }
+      h1 {
+        font-size: 16px;
+        margin: 0 0 8px 0;
+      }
+      .row {
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+        margin-bottom: 12px;
+        align-items: flex-start;
+      }
+      .box {
+        border: 1px solid var(--border);
+        padding: 8px;
+        min-width: 220px;
+      }
+      .field {
+        display: flex;
+        gap: 6px;
+        align-items: center;
+      }
+      .field input {
+        min-width: 220px;
+        padding: 4px 6px;
+        border: 1px solid var(--border);
+        background: Canvas;
+        color: CanvasText;
+        font-family: inherit;
+        font-size: 12px;
+      }
+      .field button {
+        padding: 4px 8px;
+        border: 1px solid var(--border);
+        background: Canvas;
+        color: CanvasText;
+        font-family: inherit;
+        font-size: 12px;
+        cursor: pointer;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+      th, td {
+        border: 1px solid var(--border);
+        padding: 4px 6px;
+        text-align: left;
+        white-space: nowrap;
+      }
+      th {
+        background: var(--header);
+      }
+      .muted {
+        opacity: 0.7;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Simon Metrics</h1>
+    <div class="row">
+      <div class="box">
+        <div id="status">Status: loading...</div>
+        <div id="updated" class="muted"></div>
+      </div>
+      <div class="box">
+        <div id="summary">Summary: -</div>
+      </div>
+      <div class="box">
+        <div class="muted">API Base</div>
+        <div class="field" style="margin-top: 6px;">
+          <input id="apiBase" placeholder="(same origin)" />
+          <button id="applyApi">Apply</button>
+          <button id="resetApi">Reset</button>
+        </div>
+      </div>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>ID</th>
+          <th>Mode</th>
+          <th>Status</th>
+          <th>Audio B</th>
+          <th>Decode</th>
+          <th>STT</th>
+          <th>RAG</th>
+          <th>CTX</th>
+          <th>TTFT</th>
+          <th>LLM</th>
+          <th>TTS First</th>
+          <th>TTS Total</th>
+          <th>In Tks</th>
+          <th>Out Tks</th>
+          <th>TPS</th>
+          <th>Overhead</th>
+          <th>Total</th>
+        </tr>
+      </thead>
+      <tbody id="metrics-body"></tbody>
+    </table>
+
+    <script>
+      const statusEl = document.getElementById('status');
+      const updatedEl = document.getElementById('updated');
+      const summaryEl = document.getElementById('summary');
+      const bodyEl = document.getElementById('metrics-body');
+      const apiInput = document.getElementById('apiBase');
+      const applyButton = document.getElementById('applyApi');
+      const resetButton = document.getElementById('resetApi');
+
+      const STORAGE_KEY = 'simon_admin_api_base';
+      const normalizeBase = (value) => value.replace(/\/+$/, '');
+      const params = new URLSearchParams(location.search);
+      const paramBase = params.get('api');
+      if (paramBase) {
+        localStorage.setItem(STORAGE_KEY, normalizeBase(paramBase));
+      }
+      let apiBase = normalizeBase(localStorage.getItem(STORAGE_KEY) || '');
+      apiInput.value = apiBase;
+
+      const fmt = (value, digits = 3) => {
+        if (typeof value !== 'number' || Number.isNaN(value)) return '-';
+        return value.toFixed(digits);
+      };
+
+      const fmtInt = (value) => {
+        if (typeof value !== 'number' || Number.isNaN(value)) return '-';
+        return Math.round(value).toString();
+      };
+
+      const fmtTime = (unixSeconds) => {
+        if (!unixSeconds) return '-';
+        const d = new Date(unixSeconds * 1000);
+        return d.toLocaleTimeString();
+      };
+
+      const avg = (items, key, predicate) => {
+        let sum = 0;
+        let count = 0;
+        for (const item of items) {
+          if (predicate && !predicate(item)) continue;
+          const value = item[key];
+          if (typeof value !== 'number' || Number.isNaN(value)) continue;
+          sum += value;
+          count += 1;
+        }
+        return { value: count ? sum / count : 0, count };
+      };
+
+      const render = (items) => {
+        bodyEl.innerHTML = '';
+        const rows = [...items].reverse();
+        for (const item of rows) {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td>${fmtTime(item.start_time)}</td>
+            <td>${item.id || '-'}</td>
+            <td>${item.mode || '-'}</td>
+            <td>${item.status || '-'}</td>
+            <td>${item.audio_bytes ?? 0}</td>
+            <td>${fmt(item.audio_decode)}</td>
+            <td>${fmt(item.stt)}</td>
+            <td>${fmt(item.rag)}</td>
+            <td>${fmt(item.ctx)}</td>
+            <td>${fmt(item.ttft)}</td>
+            <td>${fmt(item.llm_total)}</td>
+            <td>${fmt(item.tts_first)}</td>
+            <td>${fmt(item.tts_total)}</td>
+            <td>${fmtInt(item.input_tokens)}</td>
+            <td>${fmtInt(item.output_tokens)}</td>
+            <td>${fmt(item.tokens_per_second, 2)}</td>
+            <td>${fmt(item.overhead)}</td>
+            <td>${fmt(item.total_latency)}</td>
+          `;
+          bodyEl.appendChild(tr);
+        }
+
+        if (items.length) {
+          const okItems = items.filter((item) => item.status === 'ok');
+          const voiceItems = okItems.filter((item) => item.mode === 'voice');
+          const decodeAvg = avg(voiceItems, 'audio_decode');
+          const sttAvg = avg(voiceItems, 'stt');
+          const ttftAvg = avg(okItems, 'ttft');
+          const llmAvg = avg(okItems, 'llm_total');
+          const ttsAvg = avg(voiceItems, 'tts_total');
+          const inTokAvg = avg(okItems, 'input_tokens');
+          const outTokAvg = avg(okItems, 'output_tokens');
+          const tpsAvg = avg(okItems, 'tokens_per_second');
+          const overheadAvg = avg(okItems, 'overhead');
+          const totalAvg = avg(okItems, 'total_latency');
+
+          summaryEl.textContent =
+            `Summary: n=${items.length} ok=${okItems.length} ` +
+            `avg(decode=${fmt(decodeAvg.value)}s/${decodeAvg.count} ` +
+            `stt=${fmt(sttAvg.value)}s/${sttAvg.count} ` +
+            `ttft=${fmt(ttftAvg.value)}s/${ttftAvg.count} ` +
+            `llm=${fmt(llmAvg.value)}s/${llmAvg.count} ` +
+            `tts=${fmt(ttsAvg.value)}s/${ttsAvg.count} ` +
+            `in=${fmt(inTokAvg.value, 0)}/${inTokAvg.count} ` +
+            `out=${fmt(outTokAvg.value, 0)}/${outTokAvg.count} ` +
+            `tps=${fmt(tpsAvg.value, 2)}/${tpsAvg.count} ` +
+            `overhead=${fmt(overheadAvg.value)}s/${overheadAvg.count} ` +
+            `total=${fmt(totalAvg.value)}s/${totalAvg.count})`;
+        } else {
+          summaryEl.textContent = 'Summary: -';
+        }
+      };
+
+      const getBase = () => (apiBase ? apiBase : location.origin);
+
+      const tryFetch = async () => {
+        const url = `${getBase()}/metrics?limit=50`;
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      };
+
+      const channel = window.BroadcastChannel ? new BroadcastChannel('simon-metrics') : null;
+      const tabId = Math.random().toString(36).slice(2);
+      let isLeader = false;
+      let pollTimer = null;
+      let lastLeaderSeen = 0;
+      let leaderId = null;
+
+      const updateStatus = (text) => {
+        statusEl.textContent = text;
+        updatedEl.textContent = `Updated: ${new Date().toLocaleTimeString()}`;
+      };
+
+      const startPolling = () => {
+        if (pollTimer) return;
+        isLeader = true;
+        fetchMetrics();
+        pollTimer = setInterval(fetchMetrics, 2000);
+      };
+
+      const stopPolling = () => {
+        if (!pollTimer) return;
+        clearInterval(pollTimer);
+        pollTimer = null;
+        isLeader = false;
+      };
+
+      const fetchMetrics = async () => {
+        if (location.protocol === 'file:' && !apiBase) {
+          statusEl.textContent = 'Status: set API Base (file:// has no origin)';
+          return;
+        }
+        try {
+          const data = await tryFetch();
+          render(data.items || []);
+          updateStatus(`Status: ok (${getBase()})${isLeader ? ' leader' : ''}`);
+          if (channel) {
+            channel.postMessage({ type: 'metrics', id: tabId, base: getBase(), items: data.items || [] });
+          }
+        } catch (err) {
+          statusEl.textContent = `Status: error (${err.message})`;
+        }
+      };
+
+      if (channel) {
+        channel.onmessage = (event) => {
+          const msg = event.data || {};
+          if (msg.type === 'leader') {
+            leaderId = msg.id;
+            lastLeaderSeen = Date.now();
+            if (leaderId !== tabId) stopPolling();
+            return;
+          }
+          if (msg.type === 'metrics' && msg.base === getBase()) {
+            leaderId = msg.id || leaderId;
+            lastLeaderSeen = Date.now();
+            render(msg.items || []);
+            updateStatus(`Status: ok (${msg.base}) follower`);
+          }
+        };
+      }
+
+      const electLeader = () => {
+        if (location.protocol === 'file:' && !apiBase) {
+          stopPolling();
+          statusEl.textContent = 'Status: set API Base (file:// has no origin)';
+          return;
+        }
+        if (!channel) {
+          startPolling();
+          return;
+        }
+        const now = Date.now();
+        if (!leaderId || now - lastLeaderSeen > 5000) {
+          leaderId = tabId;
+          lastLeaderSeen = now;
+          channel.postMessage({ type: 'leader', id: tabId });
+          startPolling();
+        }
+      };
+
+      applyButton.addEventListener('click', () => {
+        apiBase = normalizeBase(apiInput.value.trim());
+        apiInput.value = apiBase;
+        localStorage.setItem(STORAGE_KEY, apiBase);
+        if (channel) {
+          channel.postMessage({ type: 'leader', id: tabId });
+        }
+        stopPolling();
+        electLeader();
+      });
+
+      resetButton.addEventListener('click', () => {
+        apiBase = '';
+        apiInput.value = '';
+        localStorage.removeItem(STORAGE_KEY);
+        if (channel) {
+          channel.postMessage({ type: 'leader', id: tabId });
+        }
+        stopPolling();
+        electLeader();
+      });
+
+      electLeader();
+      setInterval(electLeader, 2000);
+    </script>
+  </body>
+</html>

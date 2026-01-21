@@ -1,0 +1,35 @@
+# --- Core Math & Audio ---
+numpy
+scipy
+sounddevice
+soundfile
+
+# --- AI / ML Core ---
+# Torch е нужен за Silero VAD. На Mac това ще дръпне версията с MPS (Metal) поддръжка.
+torch
+torchaudio
+
+# --- STT (Hearing) ---
+faster-whisper
+
+# --- VAD (Voice Activity Detection) ---
+# Silero е най-лесно да се ползва през torch.hub, но слагаме utils ако потрябват.
+silero-vad
+
+# --- TTS (Speaking) ---
+kokoro-onnx
+onnxruntime
+# Ако onnxruntime прави мизерии на M4, смени горния ред с: onnxruntime-silicon
+
+# --- LLM Connection ---
+openai
+
+# --- Token Counting ---
+tiktoken
+
+# --- Wake Word ---
+pvporcupine
+
+# --- REST upload / MP3 ---
+pydub
+python-multipart

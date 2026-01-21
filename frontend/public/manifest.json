@@ -1,0 +1,21 @@
+{
+  "name": "Simon Neural",
+  "short_name": "Simon",
+  "start_url": "/index.html",
+  "display": "standalone",
+  "background_color": "#080808",
+  "theme_color": "#00ff41",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/1668/1668159.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/1668/1668159.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

@@ -1,0 +1,56 @@
+.DS_Store
+Thumbs.db
+.simon-run/
+
+# IDE
+.vscode/
+.idea/
+
+# Local env/secrets
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Logs/temp
+*.log
+*.pid
+*.tmp
+*.swp
+*.swo
+
+# Frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Backend
+backend/venv/
+backend/data/
+backend/models/
+
+# Local envs
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+coverage/
+.coverage
+coverage.xml
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# TLS certs
+certs/

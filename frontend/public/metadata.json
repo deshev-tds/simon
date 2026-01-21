@@ -1,0 +1,7 @@
+{
+  "name": "Neural Link",
+  "description": "A personal, low-latency AI voice assistant with a cyber-minimalist interface.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
