@@ -40,6 +40,31 @@ def _print_recursion_debug(label, query, debug, results):
             f"{row.get('role')} score={row.get('score')} content={row.get('content')}",
             flush=True,
         )
+
+
+def _record_recursion_stats(request, label, query, debug, results):
+    stats = {
+        "label": label,
+        "query": query,
+        "root_tokens": debug.get("root_tokens"),
+        "strong_tokens": debug.get("strong_tokens"),
+        "depth": debug.get("depth"),
+        "queries_used": debug.get("query_count"),
+        "raw_count": debug.get("raw_count"),
+        "deduped_count": debug.get("deduped_count"),
+        "filtered_count": debug.get("filtered_count"),
+        "returned": debug.get("returned_count"),
+        "subqueries_count": len(debug.get("subqueries", [])),
+        "query_runs": len(debug.get("queries", [])),
+        "hits": [
+            {
+                "score": row.get("score"),
+                "content": (row.get("content") or "")[:120],
+            }
+            for row in results
+        ],
+    }
+    request.config._fts_recursive_stats.append(stats)
 def _seed_message(server, session_id, content, ts_offset=0.0):
     ts = time.time() + ts_offset
     with server.db_lock:
@@ -50,7 +75,7 @@ def _seed_message(server, session_id, content, ts_offset=0.0):
         server.db_conn.commit()
 
 
-def test_fts_recursive_split_terms(server):
+def test_fts_recursive_split_terms(server, request):
     session_id = server.create_session("seed", None, None, None)
     _seed_message(server, session_id, "alpha beta signal one")
     _seed_message(server, session_id, "gamma delta signal two", ts_offset=1.0)
@@ -76,12 +101,13 @@ def test_fts_recursive_split_terms(server):
         debug=debug,
     )
     _print_recursion_debug("split_terms", query, debug, rec)
+    _record_recursion_stats(request, "split_terms", query, debug, rec)
     contents = [r["content"] for r in rec]
     assert any("alpha beta" in c for c in contents)
     assert any("gamma delta" in c for c in contents)
 
 
-def test_fts_recursive_filters_singletons(server):
+def test_fts_recursive_filters_singletons(server, request):
     session_id = server.create_session("seed", None, None, None)
     _seed_message(server, session_id, "alpha solo token")
     _seed_message(server, session_id, "alpha beta paired signal", ts_offset=1.0)
@@ -99,6 +125,7 @@ def test_fts_recursive_filters_singletons(server):
         debug=debug,
     )
     _print_recursion_debug("filter_singletons", query, debug, rec)
+    _record_recursion_stats(request, "filter_singletons", query, debug, rec)
     contents = [r["content"] for r in rec]
     assert any("alpha beta paired signal" in c for c in contents)
     assert all("alpha solo token" not in c for c in contents)

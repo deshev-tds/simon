@@ -155,3 +155,37 @@ def wait_for_condition(fn, timeout_s=3.0, sleep_s=0.05):
             return True
         time.sleep(sleep_s)
     return False
+
+
+def pytest_configure(config):
+    config._fts_recursive_stats = []
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    stats = getattr(config, "_fts_recursive_stats", [])
+    if not stats:
+        return
+    terminalreporter.write_line("[FTS-RECURSION] summary begin")
+    for item in stats:
+        terminalreporter.write_line(
+            "[FTS-RECURSION] case="
+            f"{item.get('label')} query={item.get('query')} "
+            f"depth={item.get('depth')} queries_used={item.get('queries_used')} "
+            f"returned={item.get('returned')}"
+        )
+        terminalreporter.write_line(
+            "[FTS-RECURSION] tokens "
+            f"root={item.get('root_tokens')} strong={item.get('strong_tokens')}"
+        )
+        terminalreporter.write_line(
+            "[FTS-RECURSION] counts "
+            f"raw={item.get('raw_count')} deduped={item.get('deduped_count')} "
+            f"filtered={item.get('filtered_count')} subqueries={item.get('subqueries_count')} "
+            f"query_runs={item.get('query_runs')}"
+        )
+        for hit in item.get("hits", []):
+            terminalreporter.write_line(
+                "[FTS-RECURSION] hit "
+                f"score={hit.get('score')} content={hit.get('content')}"
+            )
+    terminalreporter.write_line("[FTS-RECURSION] summary end")
