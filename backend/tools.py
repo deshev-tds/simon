@@ -84,7 +84,7 @@ def tool_search_memory(
     fts_res = []
     if scope in ["recent", "session"]:
         target_sess = session_id if scope == "session" else None
-        fts_res = db.fts_search_messages(
+        fts_res = db.fts_recursive_search(
             query,
             session_id=target_sess,
             limit=3,

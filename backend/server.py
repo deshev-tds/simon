@@ -157,6 +157,7 @@ save_interaction = db.save_interaction
 set_session_title = db.set_session_title
 get_session_window = db.get_session_window
 fts_search_messages = db.fts_search_messages
+fts_recursive_search = db.fts_recursive_search
 
 
 # --- MEMORY SYSTEM (Hardened) ---
@@ -389,7 +390,7 @@ def build_rag_context(user_text, history, memory_manager, metrics, session_id: i
     # 2) SQLite FTS5 keyword recall
     fts_hits = []
     try:
-        fts_hits = fts_search_messages(
+        fts_hits = fts_recursive_search(
             user_text,
             session_id=session_id,
             limit=FTS_MAX_HITS,

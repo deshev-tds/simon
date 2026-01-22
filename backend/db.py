@@ -10,6 +10,11 @@ from backend.config import (
     FTS_MAX_HITS,
     FTS_MIN_TOKEN_LEN,
     FTS_PER_SESSION,
+    FTS_RECURSIVE_DEPTH,
+    FTS_RECURSIVE_MAX_BRANCHES,
+    FTS_RECURSIVE_MAX_QUERIES,
+    FTS_RECURSIVE_MIN_MATCH,
+    FTS_RECURSIVE_OVERSAMPLE,
     MAX_RECENT_MESSAGES,
     MEM_MAX_ROWS,
     MEM_PRUNE_INTERVAL_S,
@@ -22,6 +27,12 @@ db_conn = None
 mem_conn = None
 
 _word_re = re.compile(r"\w+", re.UNICODE)
+_STOP_TOKENS = {
+    "a", "about", "an", "and", "are", "as", "at", "be", "by", "did", "do",
+    "does", "for", "from", "have", "how", "i", "in", "is", "it", "me", "my",
+    "of", "on", "or", "our", "say", "that", "the", "this", "to", "us", "was",
+    "were", "what", "when", "where", "who", "why", "with", "you", "your",
+}
 
 
 def _resolve_conn(conn):
@@ -518,9 +529,9 @@ def get_session_window(session_id, anchor=ANCHOR_MESSAGES, recent=MAX_RECENT_MES
     }
 
 
-def _fts_sanitize_query(text: str, join_op=" ") -> str:
+def _fts_tokenize(text: str) -> list[str]:
     if not text:
-        return ""
+        return []
     toks = [t.lower() for t in _word_re.findall(text)]
     toks = [t for t in toks if len(t) >= FTS_MIN_TOKEN_LEN]
     seen = set()
@@ -530,7 +541,57 @@ def _fts_sanitize_query(text: str, join_op=" ") -> str:
             continue
         seen.add(t)
         out.append(t)
-    return join_op.join(out[:12])
+    return out
+
+
+def _filter_stop_tokens(tokens: list[str]) -> list[str]:
+    return [t for t in tokens if t not in _STOP_TOKENS]
+
+
+def _fts_sanitize_query(text: str, join_op=" ") -> str:
+    toks = _fts_tokenize(text)
+    return join_op.join(toks[:12])
+
+
+def _build_subqueries(tokens: list[str], max_branches: int) -> list[str]:
+    if not tokens:
+        return []
+    max_branches = max(1, int(max_branches))
+    compound_limit = max(1, max_branches - 1) if max_branches > 1 else 1
+    candidates = []
+    if len(tokens) >= 2:
+        mid = len(tokens) // 2
+        left = " ".join(tokens[:mid])
+        right = " ".join(tokens[mid:])
+        if left:
+            candidates.append(left)
+        if right and right != left:
+            candidates.append(right)
+        for i in range(len(tokens) - 1):
+            candidates.append(f"{tokens[i]} {tokens[i + 1]}")
+    for tok in tokens:
+        candidates.append(tok)
+
+    seen = set()
+    out = []
+    for cand in candidates:
+        if not cand or cand in seen:
+            continue
+        if len(out) < compound_limit:
+            seen.add(cand)
+            out.append(cand)
+            continue
+        break
+
+    if len(out) < max_branches:
+        for tok in tokens:
+            if tok in seen:
+                continue
+            seen.add(tok)
+            out.append(tok)
+            if len(out) >= max_branches:
+                break
+    return out
 
 
 def fts_search_messages(
@@ -540,6 +601,7 @@ def fts_search_messages(
     cutoff_ts: float | None = None,
     conn: sqlite3.Connection | None = None,
     lock=None,
+    allow_or_fallback: bool = True,
 ):
     q = _fts_sanitize_query(query_text, " ")
     if not q:
@@ -573,7 +635,7 @@ def fts_search_messages(
             return []
 
     rows = run_query(q)
-    if not rows:
+    if allow_or_fallback and not rows:
         q_or = _fts_sanitize_query(query_text, " OR ")
         if q_or and q_or != q:
             rows = run_query(q_or)
@@ -585,6 +647,145 @@ def fts_search_messages(
         "session_id": r[3],
         "score": float(r[4]) if r[4] is not None else None
     } for r in rows]
+
+
+def _count_token_matches(text: str, tokens: list[str]) -> int:
+    if not text or not tokens:
+        return 0
+    content_toks = {t.lower() for t in _word_re.findall(text)}
+    return sum(1 for tok in tokens if tok in content_toks)
+
+
+def _dedupe_rows(rows: list[dict]) -> list[dict]:
+    merged = {}
+    for r in rows:
+        key = (r.get("session_id"), r.get("created_at"), r.get("role"), r.get("content"))
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = r
+            continue
+        score = r.get("score")
+        existing_score = existing.get("score")
+        if existing_score is None:
+            if score is not None:
+                merged[key] = r
+            continue
+        if score is not None and score < existing_score:
+            merged[key] = r
+    return list(merged.values())
+
+
+def fts_recursive_search(
+    query_text: str,
+    session_id: int | None = None,
+    limit: int = FTS_MAX_HITS,
+    cutoff_ts: float | None = None,
+    conn: sqlite3.Connection | None = None,
+    lock=None,
+    depth: int = FTS_RECURSIVE_DEPTH,
+    max_queries: int = FTS_RECURSIVE_MAX_QUERIES,
+    max_branches: int = FTS_RECURSIVE_MAX_BRANCHES,
+    oversample: int = FTS_RECURSIVE_OVERSAMPLE,
+    min_match_tokens: int = FTS_RECURSIVE_MIN_MATCH,
+    debug: dict | None = None,
+):
+    root_tokens = _fts_tokenize(query_text)
+    strong_tokens = _filter_stop_tokens(root_tokens) or root_tokens
+    if not strong_tokens:
+        return []
+    target_conn = conn or db_conn
+    target_lock = lock or db_lock
+    if target_conn is None:
+        return []
+
+    query_state = {"count": 0}
+    max_queries = max(1, int(max_queries))
+    oversample = max(1, int(oversample))
+
+    if debug is not None:
+        debug.setdefault("queries", [])
+        debug.setdefault("subqueries", [])
+        debug["root_tokens"] = root_tokens
+        debug["strong_tokens"] = strong_tokens
+        debug["depth"] = int(depth)
+        debug["max_queries"] = int(max_queries)
+        debug["max_branches"] = int(max_branches)
+        debug["oversample"] = int(oversample)
+        debug["min_match_tokens"] = int(min_match_tokens)
+
+    def run_query(q, allow_or):
+        if query_state["count"] >= max_queries:
+            return []
+        query_state["count"] += 1
+        results = fts_search_messages(
+            q,
+            session_id=session_id,
+            limit=limit * oversample,
+            cutoff_ts=cutoff_ts,
+            conn=target_conn,
+            lock=target_lock,
+            allow_or_fallback=allow_or,
+        )
+        if debug is not None:
+            debug["queries"].append({
+                "query": q,
+                "allow_or": bool(allow_or),
+                "results": len(results),
+            })
+        return results
+
+    def search_recursive(q, depth_left):
+        rows = run_query(q, allow_or=False)
+        if rows:
+            return rows
+        if depth_left <= 0:
+            return run_query(q, allow_or=True)
+        sub_tokens = _filter_stop_tokens(_fts_tokenize(q))
+        subqueries = _build_subqueries(sub_tokens or strong_tokens, max_branches)
+        if debug is not None:
+            debug["subqueries"].append({
+                "depth_left": int(depth_left),
+                "query": q,
+                "subqueries": subqueries,
+            })
+        acc = []
+        for sub in subqueries:
+            if query_state["count"] >= max_queries:
+                break
+            acc.extend(search_recursive(sub, depth_left - 1))
+            if len(acc) >= limit * oversample:
+                break
+        return acc
+
+    rows = search_recursive(query_text, int(depth))
+    if debug is not None:
+        debug["raw_count"] = len(rows)
+    if not rows:
+        if debug is not None:
+            debug["query_count"] = query_state["count"]
+            debug["returned_count"] = 0
+        return []
+
+    deduped = _dedupe_rows(rows)
+    if debug is not None:
+        debug["deduped_count"] = len(deduped)
+    if len(strong_tokens) >= 1:
+        min_match = min(max(1, int(min_match_tokens)), len(strong_tokens))
+        filtered = [
+            r for r in deduped
+            if _count_token_matches(r.get("content", ""), strong_tokens) >= min_match
+        ]
+        if filtered:
+            deduped = filtered
+    if debug is not None:
+        debug["filtered_count"] = len(deduped)
+
+    deduped.sort(key=lambda r: (r.get("score") is None, r.get("score") or 0))
+    final_rows = deduped[:limit]
+    if debug is not None:
+        debug["query_count"] = query_state["count"]
+        debug["returned_count"] = len(final_rows)
+    return final_rows
 
 
 __all__ = [
@@ -607,6 +808,8 @@ __all__ = [
     "save_interaction",
     "set_session_title",
     "get_session_window",
+    "_fts_tokenize",
     "_fts_sanitize_query",
     "fts_search_messages",
+    "fts_recursive_search",
 ]
