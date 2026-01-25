@@ -516,11 +516,16 @@ def build_rag_context(user_text, history, memory_manager, metrics, session_id: i
 
     archive_valid = []
     archive_payload = []
+    archive_age_cutoff_ts = None
+    if archive_trigger == "weak_local" and ARCHIVE_WEAK_MAX_AGE_DAYS > 0:
+        archive_age_cutoff_ts = time.time() - (ARCHIVE_WEAK_MAX_AGE_DAYS * 24 * 3600)
     if archive_trigger:
         arch_docs, arch_dists, arch_metas = memory_manager.search_archive(archive_query, n_results=3)
         for i, (doc, dist, meta) in enumerate(zip(arch_docs, arch_dists, arch_metas)):
             ts = meta.get("timestamp", 0) if meta else 0
             age_days = (time.time() - ts) / (24 * 3600) if ts > 0 else 0
+            if archive_age_cutoff_ts is not None and (not ts or ts < archive_age_cutoff_ts):
+                continue
             if dist < ARCHIVE_STRONG_THRESHOLD:
                 archive_valid.append(doc)
                 archive_payload.append({
