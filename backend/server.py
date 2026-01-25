@@ -198,6 +198,37 @@ MemoryManager = memory_mod.MemoryManager
 memory = memory_mod.memory
 print("All Models Loaded.")
 
+# --- ARCHIVE MEMORY INTENT ---
+ARCHIVE_EXPLICIT_PREFIXES = (
+    "archive:",
+    "memory:",
+    "/archive",
+    "/memory",
+)
+
+_ARCHIVE_INTENT_PATTERNS = [
+    re.compile(r"\b(chatgpt|gpt)\b.*\b(history|archive|conversation|conversations)\b"),
+    re.compile(r"\b(past|previous|earlier|last)\b.*\b(chat|conversation|discussion|talk)\b"),
+    re.compile(r"\b(do you remember|remember when|what did (we|i|you) (say|discuss|talk(?:ed)? about)|you said|you told me|i told you)\b"),
+    re.compile(r"\b(my|our)\b.*\b(history|archive|past chats?)\b"),
+    re.compile(r"\b(we talked about|we discussed)\b.*\b(before|earlier|last time|previously)\b"),
+]
+
+
+def _archive_intent(user_text: str):
+    if not user_text:
+        return False, False, ""
+    raw_text = user_text.strip()
+    lowered = raw_text.lower()
+    for prefix in ARCHIVE_EXPLICIT_PREFIXES:
+        if lowered.startswith(prefix):
+            trimmed = raw_text[len(prefix):].strip()
+            return True, True, trimmed or raw_text
+    for pattern in _ARCHIVE_INTENT_PATTERNS:
+        if pattern.search(lowered):
+            return True, False, raw_text
+    return False, False, raw_text
+
 SIMON_TOOLS = tools.SIMON_TOOLS
 tool_search_memory = tools.tool_search_memory
 tool_analyze_deep = tools.tool_analyze_deep
@@ -414,6 +445,8 @@ def build_rag_context(user_text, history, memory_manager, metrics, session_id: i
 
     history_window = window_messages(history)
 
+    archive_requested, _archive_explicit, archive_query = _archive_intent(user_text)
+
     # 1) Vector memories (UPDATED: Unpack metadatas + Two-Stage retrieval)
     # Search last 60 days first
     retrieved_docs, distances, metadatas = memory_manager.search(user_text, n_results=3, days_filter=60)
@@ -468,6 +501,35 @@ def build_rag_context(user_text, history, memory_manager, metrics, session_id: i
         if not QUIET_LOGS:
             print(f"\n \033[90m[VECTOR SEARCH] No memories found.\033[0m\n")
 
+    local_is_weak = False
+    if not valid_memories:
+        if not distances:
+            local_is_weak = True
+        elif distances[0] >= LOCAL_WEAK_THRESHOLD:
+            local_is_weak = True
+
+    archive_trigger = None
+    if archive_requested:
+        archive_trigger = "explicit"
+    elif local_is_weak:
+        archive_trigger = "weak_local"
+
+    archive_valid = []
+    archive_payload = []
+    if archive_trigger:
+        arch_docs, arch_dists, arch_metas = memory_manager.search_archive(archive_query, n_results=3)
+        for i, (doc, dist, meta) in enumerate(zip(arch_docs, arch_dists, arch_metas)):
+            ts = meta.get("timestamp", 0) if meta else 0
+            age_days = (time.time() - ts) / (24 * 3600) if ts > 0 else 0
+            if dist < ARCHIVE_STRONG_THRESHOLD:
+                archive_valid.append(doc)
+                archive_payload.append({
+                    "archive_doc": doc[:40] + "...",
+                    "dist": round(float(dist), 3),
+                    "age_days": round(age_days, 1),
+                    "rank": i + 1
+                })
+
     anchor = history_window[:ANCHOR_MESSAGES]
     remaining = history_window[ANCHOR_MESSAGES:]
     recent = remaining[-MAX_RECENT_MESSAGES:]
@@ -480,6 +542,22 @@ def build_rag_context(user_text, history, memory_manager, metrics, session_id: i
             "role": "system",
             "content": f"Relevant past memories:\n{memory_block}\n(Use these to personalize, but prioritize current context.)"
         })
+
+    if archive_valid and (archive_requested or local_is_weak):
+        archive_block = "\n".join([f"- {m}" for m in archive_valid])
+        rag_injection.append({
+            "role": "system",
+            "content": (
+                "Relevant archive memories (ChatGPT history):\n"
+                f"{archive_block}\n"
+                "(Use only if directly relevant; treat as historical context.)"
+            )
+        })
+        rag_payload.append({
+            "archive_trigger": archive_trigger,
+            "archive_hits": len(archive_valid)
+        })
+        rag_payload.extend(archive_payload)
 
     # FTS Injection
     final_fts_lines = []

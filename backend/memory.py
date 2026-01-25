@@ -9,6 +9,9 @@ from chromadb.utils import embedding_functions
 
 from backend.config import DATA_DIR, DEBUG_MODE, SKIP_VECTOR_MEMORY, TEST_MODE
 
+LOCAL_COLLECTION_NAME = "simon_memories"
+ARCHIVE_COLLECTION_NAME = "chatgpt_archive"
+
 
 class MemoryManager:
     def __init__(self):
@@ -23,7 +26,11 @@ class MemoryManager:
             **emb_kwargs,
         )
         self.collection = self.chroma_client.get_or_create_collection(
-            name="simon_memories",
+            name=LOCAL_COLLECTION_NAME,
+            embedding_function=self.emb_fn
+        )
+        self.archive_collection = self.chroma_client.get_or_create_collection(
+            name=ARCHIVE_COLLECTION_NAME,
             embedding_function=self.emb_fn
         )
         print(" Memory Loaded.")
@@ -74,6 +81,19 @@ class MemoryManager:
 
         return docs, dists, metas
 
+    def search_archive(self, query_text, n_results=3):
+        with self.lock:
+            results = self.archive_collection.query(
+                query_texts=[query_text],
+                n_results=n_results,
+                include=["documents", "distances", "metadatas"]
+            )
+
+        docs = results["documents"][0] if results["documents"] else []
+        dists = results["distances"][0] if results["distances"] else []
+        metas = results["metadatas"][0] if results["metadatas"] else []
+        return docs, dists, metas
+
     def save(self, user_text, ai_text, session_id):
         with self.lock:
             try:
@@ -104,12 +124,29 @@ class MemoryManager:
                 ids=[str(uuid.uuid4())]
             )
 
+    def save_archive(self, memory_text, metadata, memory_id=None):
+        if not memory_text:
+            return
+        mem_id = memory_id or str(uuid.uuid4())
+        with self.lock:
+            self.archive_collection.add(
+                documents=[memory_text],
+                metadatas=[metadata or {}],
+                ids=[mem_id]
+            )
+
 
 class _DummyMemory:
     def search(self, *args, **kwargs):
         return [], [], []
 
+    def search_archive(self, *args, **kwargs):
+        return [], [], []
+
     def save(self, *args, **kwargs):
+        return None
+
+    def save_archive(self, *args, **kwargs):
         return None
 
 

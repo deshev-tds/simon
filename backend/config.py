@@ -62,6 +62,16 @@ FTS_RECURSIVE_OVERSAMPLE = 5
 FTS_RECURSIVE_MIN_MATCH = 2
 
 
+def _get_float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except Exception:
+        return default
+
+
 def _get_int_env(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None or raw == "":
@@ -77,6 +87,8 @@ MEM_MAX_ROWS = _get_int_env("SIMON_MEM_MAX_ROWS", MEM_SEED_LIMIT)
 MEM_PRUNE_INTERVAL_S = _get_int_env("SIMON_MEM_PRUNE_INTERVAL_S", 60)
 RAG_DEBUG_VERBOSE = _get_int_env("SIMON_RAG_DEBUG_VERBOSE", 0) > 0
 LLM_TIMEOUT_S = _get_int_env("SIMON_LLM_TIMEOUT_S", 0)
+LOCAL_WEAK_THRESHOLD = _get_float_env("SIMON_LOCAL_WEAK_THRESHOLD", 0.45)
+ARCHIVE_STRONG_THRESHOLD = _get_float_env("SIMON_ARCHIVE_STRONG_THRESHOLD", 0.25)
 
 AGENT_MAX_TURNS = 4
 AGENT_TRIGGER_KEYWORDS = {
@@ -118,6 +130,8 @@ __all__ = [
     "MAX_RECENT_MESSAGES",
     "ANCHOR_MESSAGES",
     "RAG_THRESHOLD",
+    "LOCAL_WEAK_THRESHOLD",
+    "ARCHIVE_STRONG_THRESHOLD",
     "FTS_MAX_HITS",
     "FTS_MIN_TOKEN_LEN",
     "FTS_PER_SESSION",
