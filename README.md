@@ -64,6 +64,16 @@ To solve this, I implemented a **Dual-Index Memory**:
 
 **Why this matters:** The Recursive Agent can now use the `search_memory` tool to perform precise lookups. If the user asks, "What was the error code?", the vector search might fail, but the FTS5 layer will catch "Error 500" via token matching. This is the difference between a "chatty" assistant and a "competent" one.
 
+#### Archive Memory (ChatGPT history)
+
+Simon can ingest a ChatGPT export into a separate vector collection (`chatgpt_archive`) and the SQL session store.
+Archive recall is gated with two thresholds to avoid polluting current context:
+
+* **Implicit recall (weak local memory):** strict threshold + recent-only window. Controlled by `SIMON_ARCHIVE_STRONG_THRESHOLD` and `SIMON_ARCHIVE_WEAK_MAX_AGE_DAYS`.
+* **Explicit recall ("remember" intent):** looser threshold, no age cap. Controlled by `SIMON_ARCHIVE_EXPLICIT_THRESHOLD`.
+
+**Implication:** Raising the explicit threshold will surface more archive noise. Lowering the implicit threshold keeps the assistant more "present" but may miss older context.
+
 ### B. The Surgical Agent Loop
 
 *Located in: `process_and_stream_response*`

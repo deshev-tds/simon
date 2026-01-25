@@ -517,6 +517,10 @@ def build_rag_context(user_text, history, memory_manager, metrics, session_id: i
     archive_valid = []
     archive_payload = []
     archive_age_cutoff_ts = None
+    # Implicit archive recall stays strict and recent; explicit "remember" can be looser and older.
+    archive_threshold = ARCHIVE_STRONG_THRESHOLD
+    if archive_trigger == "explicit":
+        archive_threshold = ARCHIVE_EXPLICIT_THRESHOLD
     if archive_trigger == "weak_local" and ARCHIVE_WEAK_MAX_AGE_DAYS > 0:
         archive_age_cutoff_ts = time.time() - (ARCHIVE_WEAK_MAX_AGE_DAYS * 24 * 3600)
     if archive_trigger:
@@ -526,12 +530,13 @@ def build_rag_context(user_text, history, memory_manager, metrics, session_id: i
             age_days = (time.time() - ts) / (24 * 3600) if ts > 0 else 0
             if archive_age_cutoff_ts is not None and (not ts or ts < archive_age_cutoff_ts):
                 continue
-            if dist < ARCHIVE_STRONG_THRESHOLD:
+            if dist < archive_threshold:
                 archive_valid.append(doc)
                 archive_payload.append({
                     "archive_doc": doc[:40] + "...",
                     "dist": round(float(dist), 3),
                     "age_days": round(age_days, 1),
+                    "threshold": round(float(archive_threshold), 3),
                     "rank": i + 1
                 })
 
