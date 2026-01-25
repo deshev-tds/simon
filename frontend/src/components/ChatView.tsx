@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState, useLayoutEffect } from 'react';
 import { ConnectionStatus, Message } from '../types';
+import MarkdownMessage from './MarkdownMessage';
 import { IconMenu, IconSend, IconTerminal, IconWifi, IconWifiOff, IconWaveform } from './Icons';
 
 interface ChatViewProps {
@@ -138,12 +139,15 @@ const ChatView: React.FC<ChatViewProps> = ({ status, messages, onSendMessage, on
                     : 'px-1 py-1 font-mono text-zinc-400 tracking-tight'
                 }`}
               >
-                {msg.sender === 'ai' && (
-                  <span className="mr-2 text-accent opacity-50 select-none">{'>'}</span>
-                )}
-                {msg.text}
-                {msg.sender === 'ai' && msg.isStreaming && (
-                   <span className="inline-block w-1.5 h-3 ml-1 bg-accent/50 animate-pulse align-middle" />
+                {msg.sender === 'ai' ? (
+                  <div className="flex gap-2">
+                    <span className="text-accent opacity-50 select-none">{'>'}</span>
+                    <div className="min-w-0 flex-1">
+                      <MarkdownMessage text={msg.text} showCursor={msg.isStreaming} />
+                    </div>
+                  </div>
+                ) : (
+                  <span className="whitespace-pre-wrap">{msg.text}</span>
                 )}
               </div>
             </div>
