@@ -26,6 +26,8 @@ from backend.metrics import (
 STREAM_FLUSH_CHARS = 24
 STREAM_FLUSH_SECS = 0.05
 EXPLICIT_MEMORY_MAX_CHARS = 400
+SESSION_TITLE_MAX_CHARS = 80
+SESSION_TITLE_CONTEXT_MAX_CHARS = 800
 
 
 def _msg_to_dict(msg):
@@ -122,6 +124,80 @@ def _format_memory_context(history, max_messages=6, max_chars=2000):
     if len(text) > max_chars:
         text = text[-max_chars:]
     return text
+
+
+def _truncate_text(text, max_chars):
+    if not text:
+        return ""
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip()
+
+
+def _clean_session_title(title):
+    if not title:
+        return ""
+    cleaned = title.strip().strip('"').strip("'")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = cleaned.strip(" -–—:;,.")
+    if len(cleaned) > SESSION_TITLE_MAX_CHARS:
+        cleaned = cleaned[:SESSION_TITLE_MAX_CHARS].rstrip()
+    return cleaned
+
+
+def _generate_session_title(user_text, ai_text, client, get_current_model):
+    if client is None or get_current_model is None:
+        return ""
+    user_snip = _truncate_text(user_text, SESSION_TITLE_CONTEXT_MAX_CHARS)
+    ai_snip = _truncate_text(ai_text, SESSION_TITLE_CONTEXT_MAX_CHARS)
+    if not user_snip and not ai_snip:
+        return ""
+    try:
+        response = client.chat.completions.create(
+            model=get_current_model(),
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Generate a short session title (3-7 words) in the user's language. "
+                        "No quotes, no trailing punctuation, no emojis. Output title only."
+                    ),
+                },
+                {"role": "user", "content": f"USER:\n{user_snip}\n\nASSISTANT:\n{ai_snip}"},
+            ],
+            temperature=0.2,
+            max_tokens=32,
+        )
+        title = (response.choices[0].message.content or "").strip()
+    except Exception:
+        return ""
+    if not title:
+        return ""
+    if title.strip().upper() in {"NONE", "N/A"}:
+        return ""
+    return _clean_session_title(title)
+
+
+def _maybe_set_session_title(session_id, user_text, ai_text, client, get_current_model):
+    if not session_id:
+        return
+    try:
+        meta = db.get_session_meta(session_id)
+    except Exception:
+        meta = None
+    if meta and meta.get("title"):
+        return
+    title = _generate_session_title(user_text, ai_text, client, get_current_model)
+    if not title:
+        return
+    try:
+        db.set_session_title(session_id, title)
+        if DEBUG_MODE and not QUIET_LOGS:
+            print(f"[SESSION] Title set: {title}")
+    except Exception as exc:
+        if DEBUG_MODE and not QUIET_LOGS:
+            print(f"[SESSION] Title update failed: {exc}")
 
 
 def _summarize_explicit_memory(history, client, get_current_model):
@@ -455,6 +531,12 @@ async def process_and_stream_response(
                     print(f"Streaming Error: {e}")
 
             response_holder["text"] = final_text_buffer
+            if session_id and user_text and final_text_buffer and len(history) == 0:
+                threading.Thread(
+                    target=_maybe_set_session_title,
+                    args=(session_id, user_text, final_text_buffer, client, get_current_model),
+                    daemon=True,
+                ).start()
 
         except Exception as e:
             print(f"LLM Error: {e}")
@@ -492,9 +574,6 @@ async def process_and_stream_response(
                     args=(history_snapshot, session_id, client, get_current_model, memory),
                 ).start()
             threading.Thread(target=db.save_interaction, args=(session_id, user_text, full_reply)).start()
-            if len(history) <= 2 and user_text:
-                snippet = (user_text[:40] + "...") if len(user_text) > 40 else user_text
-                threading.Thread(target=db.set_session_title, args=(session_id, snippet)).start()
 
             metrics["end_time"] = time.time()
             _print_perf_report(metrics)

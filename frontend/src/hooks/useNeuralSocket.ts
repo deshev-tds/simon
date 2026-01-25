@@ -426,6 +426,7 @@ export const useNeuralSocket = () => {
           setIsProcessing(false); // Ако сървърът приключи без аудио
           setIsAwaitingResponse(false);
           finalizeStreamingMessage();
+          refreshSessions();
       }
       else if (text.startsWith('SYS:SESSION:')) {
           const value = text.split('SYS:SESSION:', 2)[1];

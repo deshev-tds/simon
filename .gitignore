@@ -54,3 +54,5 @@ coverage.xml
 
 # TLS certs
 certs/
+tests/system_prompt.md
+tests/system_prompt.md

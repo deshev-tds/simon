@@ -360,10 +360,13 @@ def list_sessions(limit=50, conn=None, lock=None):
     with target_lock:
         cur = target_conn.execute(
             """
-            SELECT id, COALESCE(title, '') as title, COALESCE(summary, '') as summary,
-                   COALESCE(tags, '') as tags, model, created_at, updated_at
-            FROM sessions
-            ORDER BY updated_at DESC
+            SELECT s.id, COALESCE(s.title, '') as title, COALESCE(s.summary, '') as summary,
+                   COALESCE(s.tags, '') as tags, s.model, s.created_at, s.updated_at
+            FROM sessions s
+            WHERE EXISTS (
+                SELECT 1 FROM messages m WHERE m.session_id = s.id
+            )
+            ORDER BY s.updated_at DESC
             LIMIT ?
             """,
             (limit,)
