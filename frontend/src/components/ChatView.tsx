@@ -10,6 +10,7 @@ interface ChatViewProps {
   onOpenDrawer: () => void;
   sessionTitle?: string;
   isLoadingSession?: boolean;
+  isAwaitingResponse?: boolean;
 }
 
 // Inline Arrow Icon
@@ -20,12 +21,14 @@ const IconArrowDown: React.FC<{ className?: string }> = ({ className }) => (
   </svg>
 );
 
-const ChatView: React.FC<ChatViewProps> = ({ status, messages, onSendMessage, onCallStart, onOpenDrawer, sessionTitle, isLoadingSession }) => {
+const ChatView: React.FC<ChatViewProps> = ({ status, messages, onSendMessage, onCallStart, onOpenDrawer, sessionTitle, isLoadingSession, isAwaitingResponse }) => {
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const [inputValue, setInputValue] = useState('');
   const [showScrollButton, setShowScrollButton] = useState(false);
   const [isUserAtBottom, setIsUserAtBottom] = useState(true);
+  const hasStreamingMessage = messages.some((msg) => msg.sender === 'ai' && msg.isStreaming);
+  const showIncomingIndicator = Boolean(isAwaitingResponse && !hasStreamingMessage);
 
   // 1. SCROLL STATE TRACKING
   const handleScroll = () => {
@@ -115,7 +118,7 @@ const ChatView: React.FC<ChatViewProps> = ({ status, messages, onSendMessage, on
         onScroll={handleScroll}
         className="absolute top-16 bottom-[88px] left-0 right-0 overflow-y-auto overflow-x-hidden no-scrollbar px-4 py-6 z-10 overscroll-contain"
       >
-        {messages.length === 0 && (
+        {messages.length === 0 && !showIncomingIndicator && (
           <div className="flex flex-col items-center justify-center h-full text-zinc-700 space-y-4 opacity-50 select-none">
             <IconTerminal className="w-12 h-12 mb-2 opacity-20" />
             <p className="text-xs font-mono tracking-widest">AWAITING INPUT</p>
@@ -139,12 +142,21 @@ const ChatView: React.FC<ChatViewProps> = ({ status, messages, onSendMessage, on
                   <span className="mr-2 text-accent opacity-50 select-none">{'>'}</span>
                 )}
                 {msg.text}
-                {msg.sender === 'ai' && (
+                {msg.sender === 'ai' && msg.isStreaming && (
                    <span className="inline-block w-1.5 h-3 ml-1 bg-accent/50 animate-pulse align-middle" />
                 )}
               </div>
             </div>
           ))}
+          {showIncomingIndicator && (
+            <div className="flex w-full justify-start">
+              <div className="px-1 py-1 font-mono text-zinc-500 tracking-tight flex items-center gap-2">
+                <span className="text-accent opacity-50 select-none">{'>'}</span>
+                <span className="inline-block w-1.5 h-3 bg-accent/50 animate-pulse align-middle" />
+                <span className="text-[10px] uppercase tracking-[0.2em] text-zinc-600">Incoming</span>
+              </div>
+            </div>
+          )}
           <div ref={bottomRef} className="h-1" />
         </div>
       </div>

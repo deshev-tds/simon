@@ -99,15 +99,15 @@ start_backend() {
 
   if [[ "$TLS_AVAILABLE" -eq 1 ]]; then
     echo "Starting backend (TLS on ${BACKEND_PORT})..."
-    (cd "$BACKEND_DIR" && nohup "$PYTHON_BIN" -m uvicorn server:app --host 0.0.0.0 --port "$BACKEND_PORT" \
+    (cd "$ROOT_DIR" && nohup "$PYTHON_BIN" -m uvicorn backend.server:app --host 0.0.0.0 --port "$BACKEND_PORT" \
       --ssl-keyfile "$ROOT_DIR/certs/key.pem" --ssl-certfile "$ROOT_DIR/certs/cert.pem" \
       >"$BACKEND_LOG" 2>&1 & echo $! >"$BACKEND_PID_FILE")
     echo "Starting backend (HTTP on ${BACKEND_HTTP_PORT})..."
-    (cd "$BACKEND_DIR" && nohup "$PYTHON_BIN" -m uvicorn server:app --host 0.0.0.0 --port "$BACKEND_HTTP_PORT" \
+    (cd "$ROOT_DIR" && nohup "$PYTHON_BIN" -m uvicorn backend.server:app --host 0.0.0.0 --port "$BACKEND_HTTP_PORT" \
       >"$BACKEND_HTTP_LOG" 2>&1 & echo $! >"$BACKEND_HTTP_PID_FILE")
   else
     echo "Starting backend (HTTP on ${BACKEND_PORT})..."
-    (cd "$BACKEND_DIR" && nohup "$PYTHON_BIN" -m uvicorn server:app --host 0.0.0.0 --port "$BACKEND_PORT" \
+    (cd "$ROOT_DIR" && nohup "$PYTHON_BIN" -m uvicorn backend.server:app --host 0.0.0.0 --port "$BACKEND_PORT" \
       >"$BACKEND_LOG" 2>&1 & echo $! >"$BACKEND_PID_FILE")
   fi
 

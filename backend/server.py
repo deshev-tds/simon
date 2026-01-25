@@ -1,3 +1,5 @@
+import os
+import socket
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -74,6 +76,19 @@ class _DummyClient:
         self.models = _DummyModels()
 
 
+def _allow_remote_model_downloads() -> bool:
+    if os.environ.get("SIMON_AUDIO_LOCAL_ONLY") == "1":
+        return False
+    if os.environ.get("HF_HUB_OFFLINE") == "1" or os.environ.get("TRANSFORMERS_OFFLINE") == "1":
+        return False
+    try:
+        sock = socket.create_connection(("huggingface.co", 443), timeout=1.0)
+        sock.close()
+        return True
+    except OSError:
+        return False
+
+
 if TEST_MODE:
     stt_model = _DummySTT()
     kokoro = _DummyTTS()
@@ -84,10 +99,26 @@ else:
         kokoro = _DummyTTS()
     else:
         # 1. STT
-        stt_model = WhisperModel(WHISPER_MODEL_NAME, device="cpu", compute_type="int8")
+        whisper_local_only = not _allow_remote_model_downloads()
+        whisper_cache_dir = MODELS_DIR / "whisper"
+        try:
+            stt_model = WhisperModel(
+                WHISPER_MODEL_NAME,
+                device="cpu",
+                compute_type="int8",
+                download_root=str(whisper_cache_dir),
+                local_files_only=whisper_local_only,
+            )
+        except Exception as exc:
+            print(f"STT model unavailable ({exc}). Falling back to dummy STT.")
+            stt_model = _DummySTT()
 
         # 2. TTS
-        kokoro = Kokoro(str(MODELS_DIR / "kokoro-v0_19.onnx"), str(MODELS_DIR / "voices.bin"))
+        try:
+            kokoro = Kokoro(str(MODELS_DIR / "kokoro-v0_19.onnx"), str(MODELS_DIR / "voices.bin"))
+        except Exception as exc:
+            print(f"TTS model unavailable ({exc}). Falling back to dummy TTS.")
+            kokoro = _DummyTTS()
 
     # 3. LLM Client
     llm_timeout = LLM_TIMEOUT_S if LLM_TIMEOUT_S > 0 else None

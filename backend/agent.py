@@ -22,6 +22,9 @@ from backend.metrics import (
     finalize_metrics,
 )
 
+STREAM_FLUSH_CHARS = 24
+STREAM_FLUSH_SECS = 0.05
+
 
 def _msg_to_dict(msg):
     if msg is None:
@@ -150,7 +153,11 @@ async def process_and_stream_response(
     if rag_payload:
         await websocket.send_text(f"RAG:{json.dumps(rag_payload)}")
 
-    q = asyncio.Queue(maxsize=64)
+    emit_text_deltas = not generate_audio
+    emit_final_text = not emit_text_deltas
+    emit_tts_text = False
+
+    q = asyncio.Queue(maxsize=64) if generate_audio else None
     response_holder = {"text": ""}
     sentence_endings = re.compile(r"[.!?]+")
 
@@ -187,7 +194,8 @@ async def process_and_stream_response(
                     first_audio_generated = True
 
             if not stop_event.is_set():
-                await websocket.send_text(f"LOG:AI: {clean_text}")
+                if emit_tts_text:
+                    await websocket.send_text(f"LOG:AI: {clean_text}")
                 if generate_audio and wav_bytes:
                     await websocket.send_bytes(wav_bytes)
 
@@ -202,6 +210,8 @@ async def process_and_stream_response(
             tool_chars_used = 0
 
             def enqueue_text(text):
+                if q is None:
+                    return
                 def _do_put():
                     try:
                         q.put_nowait(text)
@@ -209,6 +219,14 @@ async def process_and_stream_response(
                         if DEBUG_MODE:
                             log_console("TTS queue full; dropping chunk", "WARN")
                 loop.call_soon_threadsafe(_do_put)
+
+            def send_delta(text):
+                if not emit_text_deltas or not text or stop_evt.is_set():
+                    return
+                asyncio.run_coroutine_threadsafe(
+                    websocket.send_text(f"STREAM:AI:{text}"),
+                    loop,
+                )
 
             if is_deep_mode:
                 turn_count = 0
@@ -306,6 +324,8 @@ async def process_and_stream_response(
                         stream=True
                     )
 
+                    delta_buffer = ""
+                    last_flush = time.monotonic()
                     current_sentence = ""
                     for chunk in stream:
                         if stop_evt.is_set():
@@ -331,16 +351,26 @@ async def process_and_stream_response(
                             metrics["ttft"] = time.time() - stream_start
 
                         final_text_buffer += token
-                        current_sentence += token
+                        if emit_text_deltas:
+                            delta_buffer += token
+                            now = time.monotonic()
+                            if len(delta_buffer) >= STREAM_FLUSH_CHARS or (now - last_flush) >= STREAM_FLUSH_SECS:
+                                send_delta(delta_buffer)
+                                delta_buffer = ""
+                                last_flush = now
+                        if generate_audio:
+                            current_sentence += token
 
-                        if sentence_endings.search(current_sentence[-2:]) and len(current_sentence.strip()) > 5:
+                        if generate_audio and sentence_endings.search(current_sentence[-2:]) and len(current_sentence.strip()) > 5:
                             raw_t = current_sentence.strip()
                             clean_t = re.sub(r"[*#_`~]+", "", raw_t).strip()
                             if clean_t:
                                 enqueue_text(clean_t)
                             current_sentence = ""
 
-                    if current_sentence.strip() and not stop_evt.is_set():
+                    if emit_text_deltas and delta_buffer and not stop_evt.is_set():
+                        send_delta(delta_buffer)
+                    if generate_audio and current_sentence.strip() and not stop_evt.is_set():
                         raw_t = current_sentence.strip()
                         clean_t = re.sub(r"[*#_`~]+", "", raw_t).strip()
                         if clean_t:
@@ -356,14 +386,18 @@ async def process_and_stream_response(
         finally:
             if metrics.get("_llm_start"):
                 metrics["llm_total"] = time.time() - metrics["_llm_start"]
-            asyncio.run_coroutine_threadsafe(q.put(None), loop)
+            if q is not None:
+                asyncio.run_coroutine_threadsafe(q.put(None), loop)
 
-    consumer_task = asyncio.create_task(tts_consumer())
     loop = asyncio.get_running_loop()
+    consumer_task = asyncio.create_task(tts_consumer()) if generate_audio else None
     producer_task = asyncio.create_task(asyncio.to_thread(llm_producer_threadsafe, loop, stop_event))
 
     try:
-        await asyncio.gather(producer_task, consumer_task)
+        if consumer_task is not None:
+            await asyncio.gather(producer_task, consumer_task)
+        else:
+            await producer_task
     except asyncio.CancelledError:
         stop_event.set()
 
@@ -385,6 +419,8 @@ async def process_and_stream_response(
             metrics["end_time"] = time.time()
             _print_perf_report(metrics)
             finalize_metrics(metrics, "ok")
+            if emit_final_text:
+                await websocket.send_text(f"LOG:AI: {full_reply}")
             await websocket.send_text("DONE")
         else:
             metrics["end_time"] = time.time()

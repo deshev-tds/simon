@@ -30,6 +30,7 @@ export const useNeuralSocket = () => {
   const [aiIsSpeaking, setAiIsSpeaking] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isAwaitingResponse, setIsAwaitingResponse] = useState(false);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [currentSessionId, setCurrentSessionId] = useState<number | null>(null);
   const [isLoadingSession, setIsLoadingSession] = useState(false);
@@ -43,6 +44,7 @@ export const useNeuralSocket = () => {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioQueueRef = useRef<ArrayBuffer[]>([]);
   const isPlayingRef = useRef(false);
+  const streamingMessageIdRef = useRef<string | null>(null);
   const apiCandidates = useMemo(() => getApiCandidates(), []);
 
   const persistSessionId = useCallback((id: number | null) => {
@@ -87,8 +89,12 @@ export const useNeuralSocket = () => {
       const data = await res.json();
       if (data?.anchors && data?.recents) {
         const combined = [...data.anchors, ...data.recents].map(mapStoredMessage);
+        streamingMessageIdRef.current = null;
+        setIsAwaitingResponse(false);
         setMessages(combined);
       } else {
+        streamingMessageIdRef.current = null;
+        setIsAwaitingResponse(false);
         setMessages([]);
       }
     } catch (err) {
@@ -118,6 +124,8 @@ export const useNeuralSocket = () => {
     isPlayingRef.current = false;
     setAiIsSpeaking(false);
     setIsProcessing(false);
+    setIsAwaitingResponse(false);
+    streamingMessageIdRef.current = null;
     setMessages([]);
 
     if (socketRef.current?.readyState === WebSocket.OPEN) {
@@ -258,6 +266,7 @@ export const useNeuralSocket = () => {
         if (socket?.readyState === WebSocket.OPEN) {
             socket.send('CMD:COMMIT_AUDIO');
             setIsProcessing(true);
+            setIsAwaitingResponse(true);
         }
         stream.getTracks().forEach(track => track.stop());
         setIsRecording(false);
@@ -297,16 +306,93 @@ export const useNeuralSocket = () => {
       }
       setAiIsSpeaking(false);
       setIsProcessing(false);
+      setIsAwaitingResponse(false);
+      streamingMessageIdRef.current = null;
     }
   }, [isRecording]);
 
-  const addMessage = useCallback((text: string, sender: 'user' | 'ai') => {
+  const addUserMessage = useCallback((text: string) => {
     setMessages(prev => [...prev, {
       id: Date.now().toString() + Math.random(),
       text,
-      sender,
+      sender: 'user',
       timestamp: Date.now()
     }]);
+  }, []);
+
+  const appendAiDelta = useCallback((delta: string) => {
+    if (!delta) return;
+    setIsAwaitingResponse(false);
+    const activeId = streamingMessageIdRef.current;
+    if (!activeId) {
+      const id = Date.now().toString() + Math.random();
+      streamingMessageIdRef.current = id;
+      setMessages(prev => [...prev, {
+        id,
+        text: delta,
+        sender: 'ai',
+        timestamp: Date.now(),
+        isStreaming: true
+      }]);
+      return;
+    }
+    setMessages(prev => {
+      const last = prev[prev.length - 1];
+      if (last && last.id === activeId) {
+        return [...prev.slice(0, -1), {
+          ...last,
+          text: last.text + delta,
+          isStreaming: true
+        }];
+      }
+      return prev.map(msg => msg.id === activeId ? {
+        ...msg,
+        text: msg.text + delta,
+        isStreaming: true
+      } : msg);
+    });
+  }, []);
+
+  const finalizeStreamingMessage = useCallback(() => {
+    const activeId = streamingMessageIdRef.current;
+    if (!activeId) return;
+    setMessages(prev => {
+      const last = prev[prev.length - 1];
+      if (last && last.id === activeId) {
+        return [...prev.slice(0, -1), {
+          ...last,
+          isStreaming: false
+        }];
+      }
+      return prev.map(msg => msg.id === activeId ? { ...msg, isStreaming: false } : msg);
+    });
+    streamingMessageIdRef.current = null;
+  }, []);
+
+  const finalizeAiMessage = useCallback((text: string) => {
+    setIsAwaitingResponse(false);
+    const activeId = streamingMessageIdRef.current;
+    if (!activeId) {
+      setMessages(prev => [...prev, {
+        id: Date.now().toString() + Math.random(),
+        text,
+        sender: 'ai',
+        timestamp: Date.now()
+      }]);
+      return;
+    }
+    setMessages(prev => {
+      const last = prev[prev.length - 1];
+      if (last && last.id === activeId) {
+        return [...prev.slice(0, -1), {
+          ...last,
+          text,
+          isStreaming: false
+        }];
+      }
+      return prev.map(msg => msg.id === activeId ? { ...msg, text, isStreaming: false } : msg);
+    });
+    streamingMessageIdRef.current = null;
   }, []);
 
   // --- CONNECTION ---
@@ -338,6 +424,8 @@ export const useNeuralSocket = () => {
       const text = event.data;
       if (text === 'DONE') {
           setIsProcessing(false); // Ако сървърът приключи без аудио
+          setIsAwaitingResponse(false);
+          finalizeStreamingMessage();
       }
       else if (text.startsWith('SYS:SESSION:')) {
           const value = text.split('SYS:SESSION:', 2)[1];
@@ -350,8 +438,12 @@ export const useNeuralSocket = () => {
           }
       }
       else if (text.startsWith('SYS:')) console.log(`%c[SYS] ${text}`, 'color: cyan');
-      else if (text.startsWith('LOG:User:')) addMessage(text.replace('LOG:User:', '').trim(), 'user');
-      else if (text.startsWith('LOG:AI:')) addMessage(text.replace('LOG:AI:', '').trim(), 'ai');
+      else if (text.startsWith('LOG:User:')) addUserMessage(text.replace('LOG:User:', '').trim());
+      else if (text.startsWith('STREAM:AI:')) appendAiDelta(text.slice('STREAM:AI:'.length));
+      else if (text.startsWith('LOG:AI:')) {
+          const payload = text.slice('LOG:AI:'.length);
+          finalizeAiMessage(payload.startsWith(' ') ? payload.slice(1) : payload);
+      }
       else if (text.startsWith('RAG:')) {
           try {
               const data = JSON.parse(text.substring(4));
@@ -363,16 +455,19 @@ export const useNeuralSocket = () => {
     ws.onclose = () => {
         setStatus(ConnectionStatus.CLOSED);
         setIsProcessing(false); // Reset on disconnect
+        setIsAwaitingResponse(false);
+        streamingMessageIdRef.current = null;
         const nextIndex = (!opened && candidateIndex + 1 < socketCandidates.length) ? candidateIndex + 1 : 0;
         setTimeout(() => connect(nextIndex), opened ? 3000 : 500);
     };
 
     socketRef.current = ws;
-  }, [addMessage, handleBinaryMessage, loadSessionWindow, persistSessionId, refreshSessions, socketCandidates]);
+  }, [addUserMessage, appendAiDelta, finalizeAiMessage, finalizeStreamingMessage, handleBinaryMessage, loadSessionWindow, persistSessionId, refreshSessions, socketCandidates]);
 
   const sendMessage = useCallback((text: string) => {
     if (socketRef.current?.readyState === WebSocket.OPEN) {
         socketRef.current.send(text);
+        setIsAwaitingResponse(true);
     }
   }, []);
 
@@ -392,6 +487,7 @@ export const useNeuralSocket = () => {
     aiIsSpeaking,
     isRecording,
     isProcessing,
+    isAwaitingResponse,
     sessions,
     currentSessionId,
     isLoadingSession,

@@ -16,6 +16,7 @@ const App: React.FC = () => {
     aiIsSpeaking,
     isRecording,
     isProcessing,
+    isAwaitingResponse,
     sessions,
     currentSessionId,
     isLoadingSession,
@@ -53,6 +54,7 @@ const App: React.FC = () => {
         onOpenDrawer={() => setDrawerOpen(true)}
         sessionTitle={currentSessionTitle}
         isLoadingSession={isLoadingSession}
+        isAwaitingResponse={isAwaitingResponse}
       />
 
       <div className={`absolute bottom-20 right-6 md:bottom-10 z-20 transition-transform duration-300 ${mode === AppMode.VOICE ? 'translate-y-32' : 'translate-y-0'}`}>

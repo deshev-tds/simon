@@ -1,3 +1,5 @@
+import os
+import socket
 import threading
 import time
 import uuid
@@ -13,8 +15,12 @@ class MemoryManager:
         print("Initializing Vector Memory (ChromaDB)...")
         self.lock = threading.Lock()
         self.chroma_client = chromadb.PersistentClient(path=str(DATA_DIR / "simon_db"))
+        emb_kwargs = {}
+        if not _allow_remote_embeddings():
+            emb_kwargs["local_files_only"] = True
         self.emb_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name="all-MiniLM-L6-v2"
+            model_name="all-MiniLM-L6-v2",
+            **emb_kwargs,
         )
         self.collection = self.chroma_client.get_or_create_collection(
             name="simon_memories",
@@ -107,10 +113,32 @@ class _DummyMemory:
         return None
 
 
-if TEST_MODE or SKIP_VECTOR_MEMORY:
-    memory = _DummyMemory()
-else:
-    memory = MemoryManager()
+def _allow_remote_embeddings() -> bool:
+    if os.environ.get("SIMON_EMBEDDINGS_LOCAL_ONLY") == "1":
+        return False
+    if os.environ.get("HF_HUB_OFFLINE") == "1" or os.environ.get("TRANSFORMERS_OFFLINE") == "1":
+        return False
+    try:
+        sock = socket.create_connection(("huggingface.co", 443), timeout=1.0)
+        sock.close()
+        return True
+    except OSError:
+        return False
+
+
+def _init_memory():
+    if TEST_MODE or SKIP_VECTOR_MEMORY:
+        if DEBUG_MODE:
+            print("Vector memory disabled. Using dummy memory.")
+        return _DummyMemory()
+    try:
+        return MemoryManager()
+    except Exception as exc:
+        print(f"Vector memory unavailable ({exc}). Falling back to dummy memory.")
+        return _DummyMemory()
+
+
+memory = _init_memory()
 
 
 __all__ = ["MemoryManager", "memory"]

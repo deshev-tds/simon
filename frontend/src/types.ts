@@ -11,6 +11,7 @@ export interface Message {
   sender: 'user' | 'ai';
   timestamp: number;
   isSystem?: boolean;
+  isStreaming?: boolean;
 }
 
 export enum AppMode {

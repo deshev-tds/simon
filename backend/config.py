@@ -5,7 +5,23 @@ SAMPLE_RATE = 16000
 TTS_SAMPLE_RATE = 24000
 DEBUG_MODE = True
 QUIET_LOGS = os.environ.get("SIMON_QUIET_LOGS") == "1"
-LM_STUDIO_URL = "http://localhost:1234/v1"
+def _get_str_env(name: str, default: str) -> str:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw
+
+
+def _normalize_lm_studio_url(url: str) -> str:
+    url = url.rstrip("/")
+    if not url.endswith("/v1"):
+        url = f"{url}/v1"
+    return url
+
+
+LM_STUDIO_URL = _normalize_lm_studio_url(
+    _get_str_env("SIMON_LM_STUDIO_URL", _get_str_env("LM_STUDIO_URL", "http://localhost:1234/v1"))
+)
 BASE_DIR = Path(__file__).resolve().parent
 ROOT_DIR = BASE_DIR.parent
 FRONTEND_DIR = ROOT_DIR / "frontend"
