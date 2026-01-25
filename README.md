@@ -67,12 +67,34 @@ To solve this, I implemented a **Dual-Index Memory**:
 #### Archive Memory (ChatGPT history)
 
 Simon can ingest a ChatGPT export into a separate vector collection (`chatgpt_archive`) and the SQL session store.
-Archive recall is gated with two thresholds to avoid polluting current context:
+Archive recall is explicit-only (memory intent) to avoid polluting current context. Intent detection is configurable in `backend/memory_intents.py`.
 
-* **Implicit recall (weak local memory):** strict threshold + recent-only window. Controlled by `SIMON_ARCHIVE_STRONG_THRESHOLD` and `SIMON_ARCHIVE_WEAK_MAX_AGE_DAYS`.
-* **Explicit recall ("remember" intent):** looser threshold, no age cap. Controlled by `SIMON_ARCHIVE_EXPLICIT_THRESHOLD`.
+**Recall anchors (examples):**
+- English: "do you remember ...", "have we talked about ...", "remember when ..."
+- Bulgarian: "помниш ли ...", "спомняш ли си ...", "говорихме ли ..."
+- Prefixes: `archive:`, `memory:`, `/archive`, `/memory`
 
-**Implication:** Raising the explicit threshold will surface more archive noise. Lowering the implicit threshold keeps the assistant more "present" but may miss older context.
+When archive recall is triggered, Simon uses the archive vector index to narrow semantically relevant sessions and then pulls exact SQL excerpts via FTS. This keeps recall grounded while still handling fuzzy queries.
+
+* **Explicit recall ("remember" intent):** Controlled by `SIMON_ARCHIVE_EXPLICIT_THRESHOLD`.
+* **Implicit recall (weak local):** Disabled for now; `SIMON_ARCHIVE_STRONG_THRESHOLD` and `SIMON_ARCHIVE_WEAK_MAX_AGE_DAYS` are reserved.
+
+**Implication:** Raising the explicit threshold will surface more archive noise; keeping it strict preserves the current-session focus.
+
+**Auto-update (optional):**
+- On startup: set `SIMON_ARCHIVE_AUTO_IMPORT=1` and `SIMON_ARCHIVE_JSON_PATH=/path/to/conversations.json` (uses `--since-last` by default; set `SIMON_ARCHIVE_SINCE_LAST=0` to disable).
+- Scheduled: `python scripts/import_chatgpt_archive.py --json /path/to/conversations.json --since-last` during quiet hours.
+
+#### Explicit Memories (User-saved)
+
+Simon only writes to the `explicit_memories` collection when the user asks to save a memory. A short LLM pass extracts a concise, stable fact or preference before saving.
+Intent patterns for recall/save are configurable in `backend/memory_intents.py`.
+
+**Save anchors (examples):**
+- English: "remember this", "save this", "make a note"
+- Bulgarian: "запомни това", "запомни го", "запиши си"
+
+This collection powers spontaneous similarity recall in normal chats.
 
 ### B. The Surgical Agent Loop
 

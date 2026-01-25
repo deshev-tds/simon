@@ -5,6 +5,7 @@ import threading
 import time
 
 import backend.db as db
+import backend.memory_intents as memory_intents
 import backend.tools as tools
 from backend.audio import numpy_to_wav_bytes
 from backend.config import (
@@ -24,6 +25,7 @@ from backend.metrics import (
 
 STREAM_FLUSH_CHARS = 24
 STREAM_FLUSH_SECS = 0.05
+EXPLICIT_MEMORY_MAX_CHARS = 400
 
 
 def _msg_to_dict(msg):
@@ -103,6 +105,79 @@ def _print_perf_report(metrics):
     )
     print(f"   TOTAL: {total_pipeline:.3f}s")
     print(f"------------------------------------------\n")
+
+
+def _format_memory_context(history, max_messages=6, max_chars=2000):
+    if not history:
+        return ""
+    window = history[-max_messages:]
+    lines = []
+    for msg in window:
+        role = (msg.get("role") or "unknown").strip()
+        content = (msg.get("content") or "").strip()
+        if not content:
+            continue
+        lines.append(f"{role.title()}: {content}")
+    text = "\n".join(lines)
+    if len(text) > max_chars:
+        text = text[-max_chars:]
+    return text
+
+
+def _summarize_explicit_memory(history, client, get_current_model):
+    if client is None or get_current_model is None:
+        return ""
+    context = _format_memory_context(history)
+    if not context:
+        return ""
+    try:
+        response = client.chat.completions.create(
+            model=get_current_model(),
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You extract a single concise memory to store. "
+                        "Keep only stable facts, preferences, or commitments worth recalling later. "
+                        "Focus on what the user asked to remember; ignore assistant suggestions. "
+                        "Use the user's language. If nothing should be saved, reply with NONE."
+                    ),
+                },
+                {"role": "user", "content": f"CONTEXT:\n{context}"},
+            ],
+            temperature=0.0,
+            max_tokens=120,
+        )
+        summary = (response.choices[0].message.content or "").strip()
+    except Exception:
+        return ""
+    if not summary:
+        return ""
+    if summary.strip().upper() in {"NONE", "NO", "N/A"}:
+        return ""
+    if summary.startswith("- "):
+        summary = summary[2:].strip()
+    if len(summary) > EXPLICIT_MEMORY_MAX_CHARS:
+        summary = summary[:EXPLICIT_MEMORY_MAX_CHARS] + "..."
+    return summary
+
+
+def _save_explicit_memory(history, session_id, client, get_current_model, memory):
+    summary = _summarize_explicit_memory(history, client, get_current_model)
+    if not summary:
+        return
+    metadata = {
+        "source": "explicit",
+        "saved_by": "user_intent",
+        "timestamp": time.time(),
+    }
+    try:
+        memory.save_explicit(summary, session_id=session_id, metadata=metadata)
+        if DEBUG_MODE and not QUIET_LOGS:
+            print(f"[MEMORY] Saved explicit memory: {summary[:80]}")
+    except Exception as exc:
+        if DEBUG_MODE and not QUIET_LOGS:
+            print(f"[MEMORY] Explicit save failed: {exc}")
 
 
 async def process_and_stream_response(
@@ -410,7 +485,12 @@ async def process_and_stream_response(
             history.append({"role": "user", "content": user_text})
             history.append({"role": "assistant", "content": full_reply})
 
-            threading.Thread(target=memory.save, args=(user_text, full_reply, session_id)).start()
+            if memory_intents.detect_memory_save(user_text):
+                history_snapshot = list(history)
+                threading.Thread(
+                    target=_save_explicit_memory,
+                    args=(history_snapshot, session_id, client, get_current_model, memory),
+                ).start()
             threading.Thread(target=db.save_interaction, args=(session_id, user_text, full_reply)).start()
             if len(history) <= 2 and user_text:
                 snippet = (user_text[:40] + "...") if len(user_text) > 40 else user_text

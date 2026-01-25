@@ -16,6 +16,7 @@ from backend.config import DATA_DIR, DB_PATH  # noqa: E402
 
 
 IMAGE_TOKEN_RE = re.compile(r"\bturn\\d+image\\d+\\b")
+STATE_PATH = DATA_DIR / "chatgpt_archive_state.json"
 CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 NON_TEXT_CONTENT_TYPES = {
     "code",
@@ -230,6 +231,8 @@ def main() -> int:
         default=None,
         help="Earliest conversation date (YYYY-MM, YYYY-MM-DD, YYYY, or epoch seconds)",
     )
+    parser.add_argument("--since-last", action="store_true", help="Use last import timestamp from state file")
+    parser.add_argument("--state-file", default=str(STATE_PATH), help="Path to import state file")
     parser.add_argument("--min-year", type=int, default=None, help="Earliest year (YYYY)")
     parser.add_argument("--chunk-size", type=int, default=1400, help="Chroma doc chunk size")
     parser.add_argument("--chunk-overlap", type=int, default=150, help="Chroma chunk overlap")
@@ -263,6 +266,14 @@ def main() -> int:
     if args.since and since_ts is None:
         print(f"[ERR] Unable to parse --since value: {args.since}")
         return 1
+    if args.since_last and since_ts is None:
+        state_path = Path(args.state_file).expanduser()
+        if state_path.exists():
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                since_ts = float(state.get("last_import_ts")) if state.get("last_import_ts") else None
+            except Exception:
+                since_ts = None
 
     conn = None
     if not args.dry_run:
@@ -298,6 +309,7 @@ def main() -> int:
     skipped_old = 0
     skipped_no_ts = 0
     skipped_code_turns = 0
+    latest_seen_ts = None
 
     batch_docs = []
     batch_metas = []
@@ -328,6 +340,13 @@ def main() -> int:
             continue
 
         conv_ts = conv.get("update_time") or conv.get("create_time")
+        if conv_ts is not None:
+            try:
+                conv_ts = float(conv_ts)
+            except Exception:
+                conv_ts = None
+        if conv_ts is not None:
+            latest_seen_ts = conv_ts if latest_seen_ts is None else max(latest_seen_ts, conv_ts)
         if since_ts is not None:
             if conv_ts is None:
                 skipped_no_ts += 1
@@ -451,6 +470,19 @@ def main() -> int:
 
     flush_vectors()
     commit_sql()
+
+    if args.since_last and not args.dry_run and latest_seen_ts is not None:
+        state_path = Path(args.state_file).expanduser()
+        try:
+            state_path.write_text(
+                json.dumps(
+                    {"last_import_ts": latest_seen_ts, "updated_at": time.time()},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            print(f"[WARN] Failed to write archive state file: {exc}")
 
     print(
         "[DONE] Sessions: {0} | Messages: {1} | Archive vectors: {2}".format(

@@ -10,7 +10,7 @@ SIMON_TOOLS = [
         "type": "function",
         "function": {
             "name": "search_memory",
-            "description": "Search long-term memory (vectors) and chat history (FTS). Use to find facts, past conversations, or project details.",
+            "description": "Search explicit memories (user-saved vectors) and chat history (FTS). Use to find facts, past conversations, or project details.",
             "parameters": {
                 "type": "object",
                 "properties": {

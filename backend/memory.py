@@ -9,7 +9,7 @@ from chromadb.utils import embedding_functions
 
 from backend.config import DATA_DIR, DEBUG_MODE, SKIP_VECTOR_MEMORY, TEST_MODE
 
-LOCAL_COLLECTION_NAME = "simon_memories"
+EXPLICIT_COLLECTION_NAME = "explicit_memories"
 ARCHIVE_COLLECTION_NAME = "chatgpt_archive"
 
 
@@ -25,10 +25,11 @@ class MemoryManager:
             model_name="all-MiniLM-L6-v2",
             **emb_kwargs,
         )
-        self.collection = self.chroma_client.get_or_create_collection(
-            name=LOCAL_COLLECTION_NAME,
+        self.explicit_collection = self.chroma_client.get_or_create_collection(
+            name=EXPLICIT_COLLECTION_NAME,
             embedding_function=self.emb_fn
         )
+        self.collection = self.explicit_collection
         self.archive_collection = self.chroma_client.get_or_create_collection(
             name=ARCHIVE_COLLECTION_NAME,
             embedding_function=self.emb_fn
@@ -36,6 +37,9 @@ class MemoryManager:
         print(" Memory Loaded.")
 
     def search(self, query_text, n_results=3, days_filter=None, session_filter=None):
+        return self.search_explicit(query_text, n_results, days_filter, session_filter)
+
+    def search_explicit(self, query_text, n_results=3, days_filter=None, session_filter=None):
         where_clause = {}
 
         if session_filter is not None:
@@ -48,7 +52,7 @@ class MemoryManager:
             where_clause = None
 
         with self.lock:
-            results = self.collection.query(
+            results = self.explicit_collection.query(
                 query_texts=[query_text],
                 n_results=n_results,
                 where=where_clause,
@@ -70,7 +74,7 @@ class MemoryManager:
                 if DEBUG_MODE:
                     print("   [MEMORY] Triggering Deep Recall (Global)...")
                 with self.lock:
-                    g_res = self.collection.query(
+                    g_res = self.explicit_collection.query(
                         query_texts=[query_text],
                         n_results=n_results,
                         include=["documents", "distances", "metadatas"]
@@ -95,10 +99,16 @@ class MemoryManager:
         return docs, dists, metas
 
     def save(self, user_text, ai_text, session_id):
+        memory_text = f"User: {user_text} | AI: {ai_text}"
+        return self.save_explicit(memory_text, session_id=session_id)
+
+    def save_explicit(self, memory_text, session_id=None, metadata=None):
+        if not memory_text:
+            return
         with self.lock:
             try:
-                res = self.collection.query(
-                    query_texts=[user_text],
+                res = self.explicit_collection.query(
+                    query_texts=[memory_text],
                     n_results=1,
                     include=["distances"]
                 )
@@ -111,16 +121,18 @@ class MemoryManager:
                     print(f" Memory duplication detected (Dist: {dists[0]:.4f}). Skipping save.")
                 return
 
-            memory_text = f"User: {user_text} | AI: {ai_text}"
-            metadata = {
+            mem_meta = {
                 "role": "conversation",
+                "memory_type": "explicit",
                 "timestamp": time.time(),
                 "session_id": int(session_id) if session_id else 0
             }
+            if metadata:
+                mem_meta.update(metadata)
 
-            self.collection.add(
+            self.explicit_collection.add(
                 documents=[memory_text],
-                metadatas=[metadata],
+                metadatas=[mem_meta],
                 ids=[str(uuid.uuid4())]
             )
 
@@ -140,10 +152,16 @@ class _DummyMemory:
     def search(self, *args, **kwargs):
         return [], [], []
 
+    def search_explicit(self, *args, **kwargs):
+        return [], [], []
+
     def search_archive(self, *args, **kwargs):
         return [], [], []
 
     def save(self, *args, **kwargs):
+        return None
+
+    def save_explicit(self, *args, **kwargs):
         return None
 
     def save_archive(self, *args, **kwargs):

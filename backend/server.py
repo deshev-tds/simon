@@ -10,6 +10,8 @@ import soundfile as sf
 import io
 import re
 import threading
+import subprocess
+import sys
 from pathlib import Path
 import uuid
 import json
@@ -193,41 +195,13 @@ fts_recursive_search = db.fts_recursive_search
 
 # --- MEMORY SYSTEM (Hardened) ---
 import backend.memory as memory_mod
+import backend.memory_intents as memory_intents
 
 MemoryManager = memory_mod.MemoryManager
 memory = memory_mod.memory
 print("All Models Loaded.")
 
 # --- ARCHIVE MEMORY INTENT ---
-ARCHIVE_EXPLICIT_PREFIXES = (
-    "archive:",
-    "memory:",
-    "/archive",
-    "/memory",
-)
-
-_ARCHIVE_INTENT_PATTERNS = [
-    re.compile(r"\b(chatgpt|gpt)\b.*\b(history|archive|conversation|conversations)\b"),
-    re.compile(r"\b(past|previous|earlier|last)\b.*\b(chat|conversation|discussion|talk)\b"),
-    re.compile(r"\b(do you remember|remember when|what did (we|i|you) (say|discuss|talk(?:ed)? about)|you said|you told me|i told you)\b"),
-    re.compile(r"\b(my|our)\b.*\b(history|archive|past chats?)\b"),
-    re.compile(r"\b(we talked about|we discussed)\b.*\b(before|earlier|last time|previously)\b"),
-]
-
-
-def _archive_intent(user_text: str):
-    if not user_text:
-        return False, False, ""
-    raw_text = user_text.strip()
-    lowered = raw_text.lower()
-    for prefix in ARCHIVE_EXPLICIT_PREFIXES:
-        if lowered.startswith(prefix):
-            trimmed = raw_text[len(prefix):].strip()
-            return True, True, trimmed or raw_text
-    for pattern in _ARCHIVE_INTENT_PATTERNS:
-        if pattern.search(lowered):
-            return True, False, raw_text
-    return False, False, raw_text
 
 SIMON_TOOLS = tools.SIMON_TOOLS
 tool_search_memory = tools.tool_search_memory
@@ -242,6 +216,45 @@ def log_console(msg, type="INFO"):
     if DEBUG_MODE and not QUIET_LOGS:
         timestamp = time.strftime("%H:%M:%S")
         print(f"[{timestamp}] [{type}] {msg}")
+
+
+def _start_archive_auto_import():
+    if TEST_MODE or not ARCHIVE_AUTO_IMPORT:
+        return
+    if not ARCHIVE_AUTO_IMPORT_JSON:
+        log_console("Archive auto-import enabled but SIMON_ARCHIVE_JSON_PATH is empty.", "WARN")
+        return
+    json_path = Path(ARCHIVE_AUTO_IMPORT_JSON).expanduser()
+    if not json_path.exists():
+        log_console(f"Archive auto-import JSON not found: {json_path}", "WARN")
+        return
+
+    script_path = ROOT_DIR / "scripts" / "import_chatgpt_archive.py"
+    if not script_path.exists():
+        log_console(f"Archive importer not found: {script_path}", "WARN")
+        return
+
+    def _run():
+        cmd = [sys.executable, str(script_path), "--json", str(json_path)]
+        if ARCHIVE_AUTO_IMPORT_SINCE_LAST:
+            cmd.append("--since-last")
+        if ARCHIVE_AUTO_IMPORT_MAX_CODE_RATIO is not None:
+            cmd.extend(["--max-code-ratio", str(ARCHIVE_AUTO_IMPORT_MAX_CODE_RATIO)])
+        log_console(f"Archive auto-import started: {' '.join(cmd)}", "MEM")
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                stderr = (result.stderr or "").strip()
+                log_console(f"Archive auto-import failed (code {result.returncode}): {stderr}", "ERR")
+            else:
+                log_console("Archive auto-import completed.", "MEM")
+        except Exception as exc:
+            log_console(f"Archive auto-import error: {exc}", "ERR")
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+_start_archive_auto_import()
 
 
 def get_current_model():
@@ -445,7 +458,7 @@ def build_rag_context(user_text, history, memory_manager, metrics, session_id: i
 
     history_window = window_messages(history)
 
-    archive_requested, _archive_explicit, archive_query = _archive_intent(user_text)
+    archive_requested, _archive_explicit, archive_query = memory_intents.detect_archive_recall(user_text)
 
     # 1) Vector memories (UPDATED: Unpack metadatas + Two-Stage retrieval)
     # Search last 60 days first
@@ -501,44 +514,71 @@ def build_rag_context(user_text, history, memory_manager, metrics, session_id: i
         if not QUIET_LOGS:
             print(f"\n \033[90m[VECTOR SEARCH] No memories found.\033[0m\n")
 
-    local_is_weak = False
-    if not valid_memories:
-        if not distances:
-            local_is_weak = True
-        elif distances[0] >= LOCAL_WEAK_THRESHOLD:
-            local_is_weak = True
-
-    archive_trigger = None
-    if archive_requested:
-        archive_trigger = "explicit"
-    elif local_is_weak:
-        archive_trigger = "weak_local"
+    archive_trigger = "explicit" if archive_requested else None
 
     archive_valid = []
     archive_payload = []
-    archive_age_cutoff_ts = None
-    # Implicit archive recall stays strict and recent; explicit "remember" can be looser and older.
-    archive_threshold = ARCHIVE_STRONG_THRESHOLD
-    if archive_trigger == "explicit":
-        archive_threshold = ARCHIVE_EXPLICIT_THRESHOLD
-    if archive_trigger == "weak_local" and ARCHIVE_WEAK_MAX_AGE_DAYS > 0:
-        archive_age_cutoff_ts = time.time() - (ARCHIVE_WEAK_MAX_AGE_DAYS * 24 * 3600)
+    archive_session_ids = []
+    # Archive recall is explicit-only to avoid background pollution.
+    archive_threshold = ARCHIVE_EXPLICIT_THRESHOLD
     if archive_trigger:
         arch_docs, arch_dists, arch_metas = memory_manager.search_archive(archive_query, n_results=3)
         for i, (doc, dist, meta) in enumerate(zip(arch_docs, arch_dists, arch_metas)):
             ts = meta.get("timestamp", 0) if meta else 0
             age_days = (time.time() - ts) / (24 * 3600) if ts > 0 else 0
-            if archive_age_cutoff_ts is not None and (not ts or ts < archive_age_cutoff_ts):
-                continue
             if dist < archive_threshold:
                 archive_valid.append(doc)
+                sess_id = meta.get("session_id") if meta else None
+                if sess_id is not None:
+                    try:
+                        archive_session_ids.append(int(sess_id))
+                    except Exception:
+                        pass
                 archive_payload.append({
                     "archive_doc": doc[:40] + "...",
                     "dist": round(float(dist), 3),
                     "age_days": round(age_days, 1),
                     "threshold": round(float(archive_threshold), 3),
-                    "rank": i + 1
+                    "rank": i + 1,
+                    "session_id": sess_id,
                 })
+
+    archive_fts_lines = []
+    archive_fts_hits = []
+    if archive_requested and archive_session_ids:
+        seen_ids = set()
+        unique_sessions = []
+        for sid in archive_session_ids:
+            if sid in seen_ids:
+                continue
+            seen_ids.add(sid)
+            unique_sessions.append(sid)
+        for sid in unique_sessions[:ARCHIVE_FTS_MAX_SESSIONS]:
+            hits = fts_recursive_search(
+                archive_query,
+                session_id=sid,
+                limit=ARCHIVE_FTS_MAX_HITS,
+                conn=db_conn,
+                lock=db_lock,
+            )
+            archive_fts_hits.extend(hits)
+
+        seen_rows = set()
+        for h in archive_fts_hits:
+            role = h.get("role", "?")
+            raw_content = h.get("content") or ""
+            clean_content = raw_content.strip().replace("\n", " ")
+            if len(clean_content) > 240:
+                clean_content = clean_content[:240] + "..."
+            key = (h.get("session_id"), h.get("created_at"), role, clean_content)
+            if key in seen_rows:
+                continue
+            seen_rows.add(key)
+            score = h.get("score")
+            if score is None:
+                archive_fts_lines.append(f"- [{role}] {clean_content}")
+            else:
+                archive_fts_lines.append(f"- [{role}] {clean_content} (bm25={score:.2f})")
 
     anchor = history_window[:ANCHOR_MESSAGES]
     remaining = history_window[ANCHOR_MESSAGES:]
@@ -553,19 +593,32 @@ def build_rag_context(user_text, history, memory_manager, metrics, session_id: i
             "content": f"Relevant past memories:\n{memory_block}\n(Use these to personalize, but prioritize current context.)"
         })
 
-    if archive_valid and (archive_requested or local_is_weak):
-        archive_block = "\n".join([f"- {m}" for m in archive_valid])
-        rag_injection.append({
-            "role": "system",
-            "content": (
-                "Relevant archive memories (ChatGPT history):\n"
-                f"{archive_block}\n"
-                "(Use only if directly relevant; treat as historical context.)"
-            )
-        })
+    if archive_requested and (archive_fts_lines or archive_valid):
+        if archive_fts_lines:
+            archive_block = "\n".join(archive_fts_lines)
+            rag_injection.append({
+                "role": "system",
+                "content": (
+                    "Archive recall (ChatGPT history). Semantically matched sessions were narrowed "
+                    "via the archive index; exact excerpts are below:\n"
+                    f"{archive_block}\n"
+                    "(Treat as raw evidence; reconcile with the current turn.)"
+                )
+            })
+        else:
+            archive_block = "\n".join([f"- {m}" for m in archive_valid])
+            rag_injection.append({
+                "role": "system",
+                "content": (
+                    "Relevant archive memories (ChatGPT history):\n"
+                    f"{archive_block}\n"
+                    "(Use only if directly relevant; treat as historical context.)"
+                )
+            })
         rag_payload.append({
             "archive_trigger": archive_trigger,
-            "archive_hits": len(archive_valid)
+            "archive_hits": len(archive_valid),
+            "archive_fts_hits": len(archive_fts_lines),
         })
         rag_payload.extend(archive_payload)
 
