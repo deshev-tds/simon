@@ -1,7 +1,3 @@
-Here is the README documentation. It is structured to act as a technical deep-dive and marketing piece for your portfolio, highlighting the architectural shift from a standard RAG pipeline to a Recursive Agentic Loop based on the MIT paper.
-
----
-
 # Simon: A Recursive, Agentic Voice Assistant
 
 ### *Implementation of MIT's "Recursive Language Models" (arXiv:2512.24601)*
