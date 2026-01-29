@@ -105,7 +105,31 @@ The refactor introduces a bifurcated pipeline:
 **Code Highlight:**
 The loop logic explicitly separates "thinking tokens" from "speaking tokens." The user sees "SYS:THINKING" updates on the frontend while the backend is aggressively querying the database, effectively giving the user a window into the machine's "internal monologue" without cluttering the audio stream.
 
-### C. Context Budgeting & Token Management
+### C. RLM-lite Gate (Context Debt + Retrieval Confidence)
+
+Simon uses an explicit gate to decide when to pay the latency cost of deep/recursive reasoning. The goal is to **avoid** expensive recursion on trivial queries, but **escalate** when the relevant facts likely live outside the current prompt window.
+
+**Signals:**
+- **Context debt:** estimated session tokens ÷ window tokens.
+- **Recall / complexity intent:** keywords like "remember", "compare", "timeline", "сравни".
+- **Retrieval confidence:** weak vector match and/or zero FTS hits.
+- **Recent window short-circuit:** if the query overlaps heavily with the last N turns, skip deep mode.
+
+**Rule of thumb:**
+- Explicit intent → deep mode.
+- (Recall or complex) + (high debt or weak retrieval) → deep mode.
+- High debt override if the user is asking about the past.
+
+**Env knobs:**
+- `SIMON_RLM_ENABLED` (default `1`)
+- `SIMON_RLM_MAX_DEBT_RATIO` (default `2.5`)
+- `SIMON_RLM_MIN_DEBT_FOR_CHECK` (default `1.2`)
+- `SIMON_RLM_RECENT_WINDOW_TURNS` (default `6`)
+- `SIMON_RLM_MIN_QUERY_LEN` (default `20`)
+- `SIMON_RLM_VECTOR_WEAK_DIST` (default `0.55`)
+- `SIMON_RLM_MIN_FTS_HITS` (default `1`)
+
+### D. Context Budgeting & Token Management
 
 *Located in: `tool_search_memory` & `MAX_TOOL_OUTPUT_CHARS*`
 
@@ -155,7 +179,25 @@ The TTS endpoint (`speech_endpoint`) attempts MP3 conversion first. If it throws
 
 ## 6. Testing (Unit + Integration)
 
-Unit tests exercise the API, WebSocket flows, memdb seed/prune, and FTS retrieval. Integration tests run against a live LM Studio server (no model mocks) and verify that long context oversaturation still allows a "needle" token to be recalled via memdb and confirmed in the model response. If LM Studio has only one model loaded, you can leave `SIMON_DEFAULT_LLM_MODEL` empty to let it pick the default.
+Unit tests exercise the API, WebSocket flows, memdb seed/prune, and FTS retrieval. Integration tests run against a live LM Studio server (no LLM mocks) and verify that a "needle" token can be recalled via memdb/FTS and confirmed by the model response. If LM Studio has only one model loaded, you can leave `SIMON_DEFAULT_LLM_MODEL` empty to let it pick the default.
+
+**Methodology / Principles:**
+* **Fast by default:** Unit tests skip vector memory and audio model loads to keep the feedback loop tight.
+* **Isolation:** Test data uses a temp data dir and cleans SQLite/memdb state between tests.
+* **Causality over magic:** The needle test asserts that the needle is **not** present in the prompt window and **is** present in the RAG payload, then expects the model to echo the exact token.
+* **Randomized collision checks:** The needle/marker are UUID-based to avoid accidental matches with persistent stores; the test asserts absence before seeding.
+* **Robustness via decoys:** The needle test seeds near-collision markers (mutated) and a same-marker/wrong-token decoy to validate ranking behavior.
+
+**Rationale:**
+Unit tests are optimized for fast, deterministic feedback on core logic (API, FTS, memdb). Integration tests are the realism check: they hit a live LM Studio model and verify end-to-end recall behavior. Vector memory is opt-in because it adds external dependencies and variance.
+
+**Test parameters (defaults in `tests/conftest.py`):**
+* `SIMON_TEST_USE_FAKE_LLM=1` to force a fake LLM client. Default is **real LLM** for all tests, so LM Studio should be running unless you opt into fake mode.
+* `SIMON_SKIP_VECTOR_MEMORY=1` to skip Chroma. Set to `0` to enable vector memory tests.
+* `SIMON_SKIP_AUDIO_MODELS=1` to avoid loading TTS/STT in unit tests.
+* `SIMON_EMBEDDINGS_REMOTE_ALLOWED=1` if vector memory needs remote embedding model downloads.
+* `SIMON_DEFAULT_LLM_MODEL=""` to let LM Studio choose the only loaded model.
+* `SIMON_MEM_SEED_LIMIT`, `SIMON_MEM_MAX_ROWS`, `SIMON_MEM_PRUNE_INTERVAL_S` to control memdb seed/prune behavior.
 
 **Run the suites:**
 * `tests/run_tests.sh` (unit)
@@ -166,16 +208,19 @@ Unit tests exercise the API, WebSocket flows, memdb seed/prune, and FTS retrieva
 
 ```python
 # tests/integration/test_memdb_needle.py
-needle = "TOKEN1234"
-marker = "MARKERXYZ"
+needle = f"TOKEN_{uuid.uuid4().hex}"
+marker = f"MARKER_{uuid.uuid4().hex}"
 
-ws.send_text(f"Seed {i} {marker} {needle} synthetic payload. Reply with exactly: OK")
-...
-ws.send_text(f"What token was paired with {marker}? Read the recalled evidence and reply with the token only.")
+# assert absence in DB/Chroma, then seed 50 turns with decoys
+
+ws.send_text(
+    f"What token was paired with {marker}? "
+    "Read the recalled evidence and reply with the token only."
+)
 messages = _recv_until_done(ws)
 
 assert any(needle in line for line in preview_lines)  # memdb/FTS recall via RAG payload
-assert needle in ai_text  # model confirms the recalled token
+assert ai_text.strip() == needle  # model confirms the recalled token
 ```
 
 ---

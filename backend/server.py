@@ -448,7 +448,14 @@ async def speech_endpoint(request: Request):
 def _norm(text):
     return " ".join((text or "").lower().split())
 
-def build_rag_context(user_text, history, memory_manager, metrics, session_id: int | None = None):
+def build_rag_context(
+    user_text,
+    history,
+    memory_manager,
+    metrics,
+    session_id: int | None = None,
+    retrieval_cache: dict | None = None,
+):
     t_start = time.time()
 
     def window_messages(msgs, first=10, last=10):
@@ -460,24 +467,31 @@ def build_rag_context(user_text, history, memory_manager, metrics, session_id: i
 
     archive_requested, _archive_explicit, archive_query = memory_intents.detect_archive_recall(user_text)
 
-    # 1) Vector memories (UPDATED: Unpack metadatas + Two-Stage retrieval)
-    # Search last 60 days first
-    retrieved_docs, distances, metadatas = memory_manager.search(user_text, n_results=3, days_filter=60)
+    if retrieval_cache is None:
+        # 1) Vector memories (UPDATED: Unpack metadatas + Two-Stage retrieval)
+        # Search last 60 days first
+        retrieved_docs, distances, metadatas = memory_manager.search(user_text, n_results=3, days_filter=60)
 
-    # 2) SQLite FTS5 keyword recall
-    fts_hits = []
-    try:
-        fts_hits = fts_recursive_search(
-            user_text,
-            session_id=session_id,
-            limit=FTS_MAX_HITS,
-            conn=mem_conn,
-            lock=db_lock,
-        )
-    except Exception:
+        # 2) SQLite FTS5 keyword recall
         fts_hits = []
+        try:
+            fts_hits = fts_recursive_search(
+                user_text,
+                session_id=session_id,
+                limit=FTS_MAX_HITS,
+                conn=mem_conn,
+                lock=db_lock,
+            )
+        except Exception:
+            fts_hits = []
+    else:
+        retrieved_docs = retrieval_cache.get("docs", []) if retrieval_cache else []
+        distances = retrieval_cache.get("dists", []) if retrieval_cache else []
+        metadatas = retrieval_cache.get("metas", []) if retrieval_cache else []
+        fts_hits = retrieval_cache.get("fts_hits", []) if retrieval_cache else []
 
-    metrics['rag'] = time.time() - t_start
+    probe_s = retrieval_cache.get("probe_s", 0.0) if retrieval_cache else 0.0
+    metrics['rag'] = probe_s + (time.time() - t_start)
 
     rag_payload = []
     valid_memories = []

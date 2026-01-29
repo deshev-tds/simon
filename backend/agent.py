@@ -10,10 +10,13 @@ import backend.tools as tools
 from backend.audio import numpy_to_wav_bytes
 from backend.config import (
     AGENT_MAX_TURNS,
-    AGENT_TRIGGER_KEYWORDS,
+    ANCHOR_MESSAGES,
     DEBUG_MODE,
+    FTS_MAX_HITS,
+    MAX_RECENT_MESSAGES,
     MAX_TOOL_OUTPUT_CHARS,
     QUIET_LOGS,
+    SKIP_VECTOR_MEMORY,
     TTS_VOICE,
 )
 from backend.metrics import (
@@ -22,12 +25,52 @@ from backend.metrics import (
     estimate_tokens_from_text,
     finalize_metrics,
 )
+from backend.rlm_gate import GateContext, RLMGatekeeper
 
 STREAM_FLUSH_CHARS = 24
 STREAM_FLUSH_SECS = 0.05
 EXPLICIT_MEMORY_MAX_CHARS = 400
 SESSION_TITLE_MAX_CHARS = 80
 SESSION_TITLE_CONTEXT_MAX_CHARS = 800
+
+
+def _window_messages(msgs, first=10, last=10):
+    if len(msgs) <= first + last:
+        return msgs
+    return msgs[:first] + msgs[-last:]
+
+
+def _estimate_window_tokens(history):
+    if not history:
+        return 0
+    history_window = _window_messages(history)
+    anchor = history_window[:ANCHOR_MESSAGES]
+    remaining = history_window[ANCHOR_MESSAGES:]
+    recent = remaining[-MAX_RECENT_MESSAGES:] if MAX_RECENT_MESSAGES > 0 else []
+    return estimate_tokens_from_messages(anchor + recent)
+
+
+def _probe_retrieval(user_text, memory, session_id):
+    t_start = time.time()
+    retrieved_docs, distances, metadatas = memory.search(user_text, n_results=3, days_filter=60)
+    try:
+        fts_hits = db.fts_recursive_search(
+            user_text,
+            session_id=session_id,
+            limit=FTS_MAX_HITS,
+            conn=db.mem_conn,
+            lock=db.db_lock,
+        )
+    except Exception:
+        fts_hits = []
+    probe_s = time.time() - t_start
+    return {
+        "docs": retrieved_docs or [],
+        "dists": distances or [],
+        "metas": metadatas or [],
+        "fts_hits": fts_hits or [],
+        "probe_s": probe_s,
+    }
 
 
 def _msg_to_dict(msg):
@@ -277,7 +320,26 @@ async def process_and_stream_response(
         memory = memory_mod.memory
 
     t_ctx_start = time.time()
-    is_deep_mode = any(k in user_text.lower() for k in AGENT_TRIGGER_KEYWORDS)
+    retrieval_cache = _probe_retrieval(user_text, memory, session_id)
+    metrics["rag"] = retrieval_cache.get("probe_s", 0.0)
+    session_tokens = estimate_tokens_from_messages(history)
+    window_tokens = _estimate_window_tokens(history)
+    gate_ctx = GateContext(
+        user_query=user_text,
+        session_tokens=session_tokens,
+        window_tokens=window_tokens,
+        vector_dists=retrieval_cache.get("dists", []),
+        fts_hit_count=len(retrieval_cache.get("fts_hits", [])),
+        recent_history=history,
+        vector_enabled=not SKIP_VECTOR_MEMORY,
+    )
+    gate_decision = RLMGatekeeper.evaluate(gate_ctx)
+    metrics["rlm_gate"] = {
+        "trigger": gate_decision.trigger,
+        "reason": gate_decision.reason,
+        **(gate_decision.metrics or {}),
+    }
+    is_deep_mode = gate_decision.trigger
 
     current_messages = []
     rag_payload = []
@@ -292,7 +354,14 @@ async def process_and_stream_response(
         ]
         tools_list = tools.SIMON_TOOLS
     else:
-        context_msgs, rag_payload = build_rag_context(user_text, history, memory, metrics, session_id)
+        context_msgs, rag_payload = build_rag_context(
+            user_text,
+            history,
+            memory,
+            metrics,
+            session_id,
+            retrieval_cache=retrieval_cache,
+        )
         current_messages = context_msgs + [{"role": "user", "content": user_text}]
         tools_list = None
 
