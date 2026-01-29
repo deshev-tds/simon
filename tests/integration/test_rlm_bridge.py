@@ -96,13 +96,16 @@ def test_bridge_multi_hop_reasoning(app_client, server):
         session_id = _get_session_id(ws)
         assert session_id is not None
 
+        print(f"[BRIDGE] Session {session_id}: seeding Fact A", flush=True)
         ws.send_text(f"{fact_a} Reply: OK")
         _recv_until_done(ws, timeout_s=15.0)
 
+        print(f"[BRIDGE] Seeding {len(distractors)} distractors to push context", flush=True)
         for d in distractors:
             ws.send_text(f"{d} Reply: OK")
             _recv_until_done(ws, timeout_s=15.0)
 
+        print("[BRIDGE] Seeding Fact B (bridge)", flush=True)
         ws.send_text(f"{fact_b} Reply: OK")
         _recv_until_done(ws, timeout_s=15.0)
 
@@ -128,6 +131,7 @@ def test_bridge_multi_hop_reasoning(app_client, server):
         ws.send_text(f"SESSION:{session_id}")
         _expect_session(ws, session_id)
 
+        print("[BRIDGE] Querying for multi-hop code (expect tool usage + auto-hop if needed)", flush=True)
         ws.send_text(query)
         messages = _recv_until_done(ws, timeout_s=60.0)
 
@@ -137,6 +141,13 @@ def test_bridge_multi_hop_reasoning(app_client, server):
     tool_msgs = [m for m in messages if "Consulting memory" in m]
     assert tool_msgs, "Expected search_memory tool usage in deep mode."
 
+    auto_hop_msgs = [m for m in messages if "Following bridge" in m]
+    if auto_hop_msgs:
+        print(f"[BRIDGE] Auto-hop executed ({len(auto_hop_msgs)}).", flush=True)
+    else:
+        print("[BRIDGE] Auto-hop not observed (model may have found code in first hop).", flush=True)
+
+    print(f"[BRIDGE] AI reply: {ai_reply_clean}", flush=True)
     assert ai_reply_clean == target_code, (
         f"Bridge failed. Expected '{target_code}', got '{ai_reply_clean}'."
     )

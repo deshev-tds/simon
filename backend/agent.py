@@ -50,6 +50,59 @@ _UNCERTAIN_PHRASES = (
 _CODE_PATTERN = re.compile(r"\b[A-Z0-9]{2,}[-_][A-Z0-9]{2,}\b|\b[A-Z0-9]{6,}\b")
 _HAS_DIGIT = re.compile(r"\d")
 _HAS_UPPER_SEQ = re.compile(r"[A-Z]{2,}")
+_CODE_INTENT = ("code", "token", "key", "id")
+_BRIDGE_STOPWORDS = {
+    "the", "a", "an", "this", "that", "these", "those", "project", "protocol",
+    "update", "confidential", "log", "entry", "alpha", "beta", "uses", "code",
+}
+
+
+def _extract_bridge_candidates(text: str, query_lower: str) -> list[str]:
+    if not text:
+        return []
+    hyphenated = re.findall(r"\b[A-Z][A-Za-z0-9]+(?:-[A-Za-z0-9]+)+\b", text)
+    proper = re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}\b", text)
+    seen = set()
+    candidates = []
+    for cand in hyphenated + proper:
+        norm = cand.strip()
+        key = norm.lower()
+        if not norm or key in seen:
+            continue
+        if key in query_lower:
+            continue
+        if key in _BRIDGE_STOPWORDS:
+            continue
+        seen.add(key)
+        candidates.append(norm)
+    return candidates
+
+
+def _maybe_auto_hop(user_text: str, tool_text: str, session_id: int, memory, metrics: dict):
+    query_lower = (user_text or "").lower()
+    if not any(k in query_lower for k in _CODE_INTENT):
+        return None
+    if _CODE_PATTERN.search(tool_text):
+        return None
+
+    candidates = _extract_bridge_candidates(tool_text, query_lower)
+    if not candidates:
+        return None
+
+    keyword = next((k for k in _CODE_INTENT if k in query_lower), "code")
+    bridge = candidates[0]
+    hop_query = f"{bridge} {keyword}"
+    result = tools.tool_search_memory(
+        hop_query,
+        scope="session",
+        session_id=session_id,
+        memory=memory,
+        mem_conn=db.mem_conn,
+        db_lock=db.db_lock,
+    )
+    metrics.setdefault("rlm_autohop", [])
+    metrics["rlm_autohop"].append({"query": hop_query, "bridge": bridge})
+    return {"query": hop_query, "result": result}
 
 
 def _extract_message_text(msg):
@@ -67,7 +120,7 @@ def _needs_fallback(user_text: str, reply_text: str, gate_metrics: dict) -> bool
     if any(p in lower for p in _UNCERTAIN_PHRASES):
         return True
     query_lower = (user_text or "").lower()
-    if any(k in query_lower for k in ("code", "token", "key", "id")):
+    if any(k in query_lower for k in _CODE_INTENT):
         if not _CODE_PATTERN.search(reply_text):
             if not (_HAS_DIGIT.search(reply_text) or _HAS_UPPER_SEQ.search(reply_text)):
                 return True
@@ -446,6 +499,7 @@ async def process_and_stream_response(
             ]
             tool_chars_used = 0
             turn_count = 0
+            auto_hop_used = False
             while turn_count < AGENT_MAX_TURNS and not stop_event.is_set():
                 turn_count += 1
                 try:
@@ -468,6 +522,7 @@ async def process_and_stream_response(
                 if tool_calls:
                     deep_messages.append(msg_dict)
                     await websocket.send_text("SYS:THINKING: Consulting memory...")
+                    tool_texts = []
                     for tool_call in tool_calls:
                         fn = tool_call.get("function") or {}
                         fn_name = fn.get("name") or tool_call.get("name")
@@ -506,10 +561,28 @@ async def process_and_stream_response(
                         else:
                             result_str = result_str[:remain]
                         tool_chars_used += len(result_str)
+                        tool_texts.append(result_str)
 
                         tool_call_id = tool_call.get("id") or tool_call.get("tool_call_id")
                         tool_msg = {"role": "tool", "tool_call_id": tool_call_id, "content": result_str}
                         deep_messages.append(tool_msg)
+                    if not auto_hop_used and tool_texts:
+                        hop = _maybe_auto_hop(
+                            user_text,
+                            "\n".join(tool_texts),
+                            session_id,
+                            memory,
+                            metrics,
+                        )
+                        if hop:
+                            auto_hop_used = True
+                            await websocket.send_text("SYS:THINKING: Following bridge...")
+                            hop_msg = {
+                                "role": "tool",
+                                "tool_call_id": f"auto-hop-{turn_count}",
+                                "content": str(hop["result"]),
+                            }
+                            deep_messages.append(hop_msg)
                 else:
                     break
 
@@ -645,6 +718,7 @@ async def process_and_stream_response(
 
             if is_deep_mode:
                 turn_count = 0
+                auto_hop_used = False
                 while turn_count < AGENT_MAX_TURNS and not stop_evt.is_set():
                     turn_count += 1
 
@@ -674,6 +748,7 @@ async def process_and_stream_response(
                             loop,
                         )
 
+                        tool_texts = []
                         for tool_call in tool_calls:
                             fn = tool_call.get("function") or {}
                             fn_name = fn.get("name") or tool_call.get("name")
@@ -715,10 +790,32 @@ async def process_and_stream_response(
                             else:
                                 result_str = result_str[:remain]
                             tool_chars_used += len(result_str)
+                            tool_texts.append(result_str)
 
                             tool_call_id = tool_call.get("id") or tool_call.get("tool_call_id")
                             tool_msg = {"role": "tool", "tool_call_id": tool_call_id, "content": result_str}
                             current_messages.append(tool_msg)
+
+                        if not auto_hop_used and tool_texts:
+                            hop = _maybe_auto_hop(
+                                user_text,
+                                "\n".join(tool_texts),
+                                session_id,
+                                memory,
+                                metrics,
+                            )
+                            if hop:
+                                auto_hop_used = True
+                                asyncio.run_coroutine_threadsafe(
+                                    websocket.send_text("SYS:THINKING: Following bridge..."),
+                                    loop,
+                                )
+                                hop_msg = {
+                                    "role": "tool",
+                                    "tool_call_id": f"auto-hop-{turn_count}",
+                                    "content": str(hop["result"]),
+                                }
+                                current_messages.append(hop_msg)
                     else:
                         break
 
