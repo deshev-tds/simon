@@ -1,8 +1,9 @@
+import hashlib
 import os
-import socket
 import threading
 import time
 import uuid
+from difflib import SequenceMatcher
 
 import chromadb
 from chromadb.utils import embedding_functions
@@ -43,7 +44,10 @@ class MemoryManager:
         where_clause = {}
 
         if session_filter is not None:
-            where_clause["session_id"] = int(session_filter)
+            try:
+                where_clause["session_id"] = int(session_filter)
+            except (TypeError, ValueError):
+                where_clause["session_id_raw"] = str(session_filter)
         elif days_filter is not None:
             cutoff_ts = time.time() - (days_filter * 24 * 3600)
             where_clause["timestamp"] = {"$gte": cutoff_ts}
@@ -64,13 +68,7 @@ class MemoryManager:
         metas = results["metadatas"][0] if results["metadatas"] else []
 
         if session_filter is None and days_filter is not None:
-            need_deep = False
             if len(docs) < n_results:
-                need_deep = True
-            elif dists and dists[0] > 0.45:
-                need_deep = True
-
-            if need_deep:
                 if DEBUG_MODE:
                     print("   [MEMORY] Triggering Deep Recall (Global)...")
                 with self.lock:
@@ -105,27 +103,49 @@ class MemoryManager:
     def save_explicit(self, memory_text, session_id=None, metadata=None):
         if not memory_text:
             return
+        norm_text = _normalize_text(memory_text)
+        content_hash = _hash_text(norm_text)
         with self.lock:
             try:
+                # Exact/normalized dedupe by hash
+                exact = self.explicit_collection.get(
+                    where={"content_hash": content_hash},
+                    include=["ids"],
+                )
+                if exact and exact.get("ids"):
+                    if DEBUG_MODE:
+                        print(" Memory duplication detected (exact hash). Skipping save.")
+                    return
+
+                # Soft semantic dedupe only if highly lexically similar
                 res = self.explicit_collection.query(
                     query_texts=[memory_text],
                     n_results=1,
-                    include=["distances"]
+                    include=["distances", "documents"]
                 )
                 dists = res["distances"][0] if res.get("distances") else []
+                docs = res["documents"][0] if res.get("documents") else []
             except Exception:
                 dists = []
+                docs = []
 
-            if dists and dists[0] < 0.2:
-                if DEBUG_MODE:
-                    print(f" Memory duplication detected (Dist: {dists[0]:.4f}). Skipping save.")
-                return
+            if dists and docs:
+                candidate = _normalize_text(docs[0])
+                lex_sim = _lexical_similarity(norm_text, candidate)
+                if dists[0] < 0.1 and lex_sim >= 0.9:
+                    if DEBUG_MODE:
+                        print(
+                            f" Memory duplication detected (dist={dists[0]:.4f}, lex={lex_sim:.3f}). Skipping save."
+                        )
+                    return
 
             mem_meta = {
                 "role": "conversation",
                 "memory_type": "explicit",
                 "timestamp": time.time(),
-                "session_id": int(session_id) if session_id else 0
+                "session_id": _coerce_session_id(session_id),
+                "session_id_raw": str(session_id) if session_id is not None else "",
+                "content_hash": content_hash,
             }
             if metadata:
                 mem_meta.update(metadata)
@@ -173,12 +193,30 @@ def _allow_remote_embeddings() -> bool:
         return False
     if os.environ.get("HF_HUB_OFFLINE") == "1" or os.environ.get("TRANSFORMERS_OFFLINE") == "1":
         return False
+    return os.environ.get("SIMON_EMBEDDINGS_REMOTE_ALLOWED") == "1"
+
+
+def _normalize_text(text: str) -> str:
+    return " ".join((text or "").strip().lower().split())
+
+
+def _hash_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _lexical_similarity(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def _coerce_session_id(value) -> int:
+    if value is None:
+        return 0
     try:
-        sock = socket.create_connection(("huggingface.co", 443), timeout=1.0)
-        sock.close()
-        return True
-    except OSError:
-        return False
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _init_memory():

@@ -220,32 +220,39 @@ def init_mem_db():
     return conn
 
 
-def seed_mem_db_from_disk(disk_conn, mem_conn, limit=MEM_SEED_LIMIT, batch_size=1000, cutoff_ts=None, lock=None):
+def seed_mem_db_from_disk(disk_conn, mem_conn, limit=MEM_SEED_LIMIT, batch_size=1000, seed_before_ts=None, lock=None):
     if limit <= 0:
         return
     if mem_conn is None:
         return
     target_lock = _resolve_lock(lock)
     ro_conn = None
+    src_conn = None
+    close_src = False
     try:
-        ro_conn = sqlite3.connect(
-            f"file:{DB_PATH}?mode=ro",
-            uri=True,
-            check_same_thread=False
-        )
-        ro_conn.execute("PRAGMA busy_timeout=5000;")
+        if disk_conn is not None:
+            src_conn = disk_conn
+        else:
+            ro_conn = sqlite3.connect(
+                f"file:{DB_PATH}?mode=ro",
+                uri=True,
+                check_same_thread=False
+            )
+            ro_conn.execute("PRAGMA busy_timeout=5000;")
+            src_conn = ro_conn
+            close_src = True
         params = []
         sql = """
             SELECT session_id, role, content, tokens, audio_path, created_at
             FROM messages
         """
-        if cutoff_ts is not None:
+        if seed_before_ts is not None:
             sql += " WHERE created_at <= ?"
-            params.append(float(cutoff_ts))
+            params.append(float(seed_before_ts))
         sql += " ORDER BY id DESC LIMIT ?"
         params.append(int(limit))
 
-        rows = ro_conn.execute(sql, tuple(params)).fetchall()
+        rows = src_conn.execute(sql, tuple(params)).fetchall()
         if not rows:
             return
         rows = list(reversed(rows))
@@ -267,8 +274,8 @@ def seed_mem_db_from_disk(disk_conn, mem_conn, limit=MEM_SEED_LIMIT, batch_size=
             print(f"[WARN] In-memory FTS seed failed: {_e}")
     finally:
         try:
-            if ro_conn:
-                ro_conn.close()
+            if close_src and src_conn:
+                src_conn.close()
         except Exception:
             pass
 
@@ -296,13 +303,13 @@ def prune_mem_db(mem_conn, max_rows=MEM_MAX_ROWS, interval_s=MEM_PRUNE_INTERVAL_
                 if count <= max_rows:
                     continue
                 cutoff_row = mem_conn.execute(
-                    "SELECT id FROM messages ORDER BY id DESC LIMIT 1 OFFSET ?",
+                    "SELECT created_at FROM messages ORDER BY created_at DESC LIMIT 1 OFFSET ?",
                     (max_rows - 1,)
                 ).fetchone()
                 if not cutoff_row:
                     continue
-                cutoff_id = cutoff_row[0]
-                mem_conn.execute("DELETE FROM messages WHERE id < ?", (cutoff_id,))
+                cutoff_ts = cutoff_row[0]
+                mem_conn.execute("DELETE FROM messages WHERE created_at < ?", (cutoff_ts,))
                 mem_conn.commit()
             if DEBUG_MODE:
                 print(f"[MEM] Pruned in-memory FTS to {max_rows} rows.")
@@ -323,10 +330,10 @@ def start_mem_threads(
     if db_conn is None or mem_conn is None:
         return None
     target_lock = _resolve_lock(db_lock)
-    _mem_seed_cutoff = time.time()
+    _mem_seed_before_ts = time.time()
     seed_thread = threading.Thread(
         target=seed_mem_db_from_disk,
-        args=(db_conn, mem_conn, mem_seed_limit, 1000, _mem_seed_cutoff),
+        args=(db_conn, mem_conn, mem_seed_limit, 1000, _mem_seed_before_ts),
         kwargs={"lock": target_lock},
         daemon=True
     )
@@ -363,9 +370,6 @@ def list_sessions(limit=50, conn=None, lock=None):
             SELECT s.id, COALESCE(s.title, '') as title, COALESCE(s.summary, '') as summary,
                    COALESCE(s.tags, '') as tags, s.model, s.created_at, s.updated_at
             FROM sessions s
-            WHERE EXISTS (
-                SELECT 1 FROM messages m WHERE m.session_id = s.id
-            )
             ORDER BY s.updated_at DESC
             LIMIT ?
             """,

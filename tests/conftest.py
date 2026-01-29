@@ -99,7 +99,13 @@ def server(tmp_path_factory):
         sys.path.insert(0, str(root))
     data_dir = tmp_path_factory.mktemp("data")
     models_dir = tmp_path_factory.mktemp("models")
-    os.environ["SIMON_TEST_MODE"] = "1"
+    use_fake_llm = os.environ.get("SIMON_TEST_USE_FAKE_LLM", "0") == "1"
+    if use_fake_llm:
+        os.environ["SIMON_TEST_MODE"] = "1"
+    else:
+        os.environ["SIMON_TEST_MODE"] = "0"
+        os.environ["SIMON_SKIP_AUDIO_MODELS"] = "1"
+        os.environ["SIMON_SKIP_VECTOR_MEMORY"] = "1"
     os.environ["SIMON_DATA_DIR"] = str(data_dir)
     os.environ["SIMON_MODELS_DIR"] = str(models_dir)
     os.environ["SIMON_MEM_SEED_LIMIT"] = "0"
@@ -107,12 +113,14 @@ def server(tmp_path_factory):
     os.environ["SIMON_MEM_PRUNE_INTERVAL_S"] = "3600"
     import backend.server as server_module
     importlib.reload(server_module)
+    server_module._using_fake_llm = use_fake_llm
     return server_module
 
 
 @pytest.fixture()
 def app_client(server, monkeypatch):
-    monkeypatch.setattr(server, "client", FakeClient())
+    if getattr(server, "_using_fake_llm", False):
+        monkeypatch.setattr(server, "client", FakeClient())
     monkeypatch.setattr(server, "stt_model", FakeSTT())
     monkeypatch.setattr(server, "kokoro", FakeKokoro())
     return TestClient(server.app)

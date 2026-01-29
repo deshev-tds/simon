@@ -2,10 +2,8 @@ import re
 
 # Recall intent (deep archive).
 ARCHIVE_EXPLICIT_PREFIXES = (
-    "archive:",
-    "memory:",
-    "/archive",
-    "/memory",
+    "/archive:",
+    "/memory:",
 )
 
 # Recall intent triggers (English + Bulgarian). Tune these lists as needed.
@@ -75,7 +73,7 @@ def detect_archive_recall(user_text: str):
             trimmed = raw_text[len(prefix):].strip()
             return True, True, trimmed or raw_text
     for pattern in _RECALL_PATTERNS:
-        if pattern.search(lowered):
+        if pattern.search(raw_text):
             return True, False, raw_text
     return False, False, raw_text
 
@@ -83,9 +81,9 @@ def detect_archive_recall(user_text: str):
 def detect_memory_save(user_text: str) -> bool:
     if not user_text:
         return False
-    lowered = user_text.strip().lower()
+    raw_text = user_text.strip()
     for pattern in _SAVE_PATTERNS:
-        if pattern.search(lowered):
+        if pattern.search(raw_text):
             return True
     return False
 

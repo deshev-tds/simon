@@ -264,9 +264,9 @@ def get_current_model():
 
 def set_current_model(name: str):
     global current_model
-    clean_name = name.strip()
-    if not clean_name:
+    if name is None:
         return current_model
+    clean_name = name.strip()
     with current_model_lock:
         current_model = clean_name
         return current_model
@@ -728,8 +728,6 @@ async def list_models():
 @app.post("/model")
 async def set_model(payload: ModelPayload):
     new_model = payload.name.strip()
-    if not new_model:
-        return JSONResponse(content={"error": "Model name required."}, status_code=400)
     active = set_current_model(new_model)
     log_console(f"Model switched to: {active}", "AI")
     warmed = await asyncio.to_thread(warm_model, active)

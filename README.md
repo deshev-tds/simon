@@ -68,7 +68,7 @@ Archive recall is explicit-only (memory intent) to avoid polluting current conte
 **Recall anchors (examples):**
 - English: "do you remember ...", "have we talked about ...", "remember when ..."
 - Bulgarian: "помниш ли ...", "спомняш ли си ...", "говорихме ли ..."
-- Prefixes: `archive:`, `memory:`, `/archive`, `/memory`
+- Prefixes: `/archive:`, `/memory:`
 
 When archive recall is triggered, Simon uses the archive vector index to narrow semantically relevant sessions and then pulls exact SQL excerpts via FTS. This keeps recall grounded while still handling fuzzy queries.
 
@@ -85,6 +85,7 @@ When archive recall is triggered, Simon uses the archive vector index to narrow 
 
 Simon only writes to the `explicit_memories` collection when the user asks to save a memory. A short LLM pass extracts a concise, stable fact or preference before saving.
 Intent patterns for recall/save are configurable in `backend/memory_intents.py`.
+Remote embeddings are **opt-in**: set `SIMON_EMBEDDINGS_REMOTE_ALLOWED=1` to allow remote model downloads; otherwise embeddings run in local-only mode.
 
 **Save anchors (examples):**
 - English: "remember this", "save this", "make a note"
@@ -154,7 +155,7 @@ The TTS endpoint (`speech_endpoint`) attempts MP3 conversion first. If it throws
 
 ## 6. Testing (Unit + Integration)
 
-Unit tests exercise the API, WebSocket flows, memdb seed/prune, and FTS retrieval. Integration tests run against a live LM Studio server (no model mocks) and verify that long context oversaturation still allows a "needle" token to be recalled via memdb and confirmed in the model response.
+Unit tests exercise the API, WebSocket flows, memdb seed/prune, and FTS retrieval. Integration tests run against a live LM Studio server (no model mocks) and verify that long context oversaturation still allows a "needle" token to be recalled via memdb and confirmed in the model response. If LM Studio has only one model loaded, you can leave `SIMON_DEFAULT_LLM_MODEL` empty to let it pick the default.
 
 **Run the suites:**
 * `tests/run_tests.sh` (unit)

@@ -31,17 +31,27 @@ def test_memdb_seed_and_prune_threads(server):
     assert mem_count == 0
 
     stop_event = threading.Event()
-    threads = server.start_mem_threads(stop_event=stop_event)
+    threads = server.db.start_mem_threads(
+        db_conn=server.db_conn,
+        mem_conn=server.mem_conn,
+        mem_seed_limit=server.MEM_SEED_LIMIT,
+        mem_max_rows=server.MEM_MAX_ROWS,
+        mem_prune_interval_s=server.MEM_PRUNE_INTERVAL_S,
+        stop_event=stop_event,
+        db_lock=server.db_lock,
+    )
     assert threads is not None
 
     def mem_count_now():
         with server.db_lock:
             return server.mem_conn.execute("SELECT COUNT(1) FROM messages").fetchone()[0]
 
-    assert _wait_for_condition(lambda: mem_count_now() >= 30)
+    assert _wait_for_condition(lambda: mem_count_now() >= 10)
 
+    keep_start = 30 - server.MEM_MAX_ROWS + 1
+    keep_token = f"TOKEN{keep_start + 4:04d}"
     hits = server.fts_search_messages(
-        "TOKEN0005",
+        keep_token,
         session_id=session_id,
         conn=server.mem_conn,
         lock=server.db_lock,

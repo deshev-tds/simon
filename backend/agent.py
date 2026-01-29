@@ -305,7 +305,7 @@ async def process_and_stream_response(
         await websocket.send_text(f"RAG:{json.dumps(rag_payload)}")
 
     emit_text_deltas = not generate_audio
-    emit_final_text = not emit_text_deltas
+    emit_final_text = True
     emit_tts_text = False
 
     q = asyncio.Queue(maxsize=64) if generate_audio else None
