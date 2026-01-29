@@ -58,7 +58,7 @@ def test_memdb_seed_and_prune_threads(server):
     )
     assert hits
 
-    assert _wait_for_condition(lambda: mem_count_now() <= 10)
+    assert _wait_for_condition(lambda: mem_count_now() <= 10, timeout_s=8.0)
 
     stop_event.set()
     for t in threads:

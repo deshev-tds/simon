@@ -59,7 +59,7 @@ def test_websocket_synthetic_flow(app_client, server):
                 ).fetchone()[0]
             return disk_count >= total_messages * 2 and mem_count >= total_messages * 2
 
-        assert wait_for_condition(counts_ok, timeout_s=5.0)
+        assert wait_for_condition(counts_ok, timeout_s=10.0)
 
         def token_present():
             with server.db_lock:

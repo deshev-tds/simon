@@ -285,7 +285,9 @@ def prune_mem_db(mem_conn, max_rows=MEM_MAX_ROWS, interval_s=MEM_PRUNE_INTERVAL_
         return
     if mem_conn is None:
         return
-    if TEST_MODE:
+    if interval_s is None:
+        interval_s = MEM_PRUNE_INTERVAL_S
+    if TEST_MODE or interval_s < 5:
         interval_s = max(1, interval_s)
     else:
         interval_s = max(5, interval_s)
