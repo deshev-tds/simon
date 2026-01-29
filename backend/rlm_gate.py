@@ -27,7 +27,8 @@ _STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from",
     "if", "in", "into", "is", "it", "of", "on", "or", "that", "the", "to",
     "was", "were", "with", "you", "your", "we", "i", "me", "my", "our",
-    "this", "that", "these", "those",
+    "this", "that", "these", "those", "what", "when", "where", "who", "why",
+    "which", "how",
     "и", "в", "на", "за", "с", "по", "от", "какво", "как", "ти", "ние",
 }
 
