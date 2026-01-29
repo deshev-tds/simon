@@ -16,6 +16,7 @@ from backend.config import (
     MAX_RECENT_MESSAGES,
     MAX_TOOL_OUTPUT_CHARS,
     QUIET_LOGS,
+    RLM_FALLBACK_ENABLED,
     SKIP_VECTOR_MEMORY,
     TTS_VOICE,
 )
@@ -32,6 +33,47 @@ STREAM_FLUSH_SECS = 0.05
 EXPLICIT_MEMORY_MAX_CHARS = 400
 SESSION_TITLE_MAX_CHARS = 80
 SESSION_TITLE_CONTEXT_MAX_CHARS = 800
+
+_UNCERTAIN_PHRASES = (
+    "not sure",
+    "don't know",
+    "dont know",
+    "cannot find",
+    "can't find",
+    "no information",
+    "no info",
+    "not available",
+    "unsure",
+    "i'm not sure",
+    "im not sure",
+)
+_CODE_PATTERN = re.compile(r"\b[A-Z0-9]{2,}[-_][A-Z0-9]{2,}\b|\b[A-Z0-9]{6,}\b")
+_HAS_DIGIT = re.compile(r"\d")
+_HAS_UPPER_SEQ = re.compile(r"[A-Z]{2,}")
+
+
+def _extract_message_text(msg):
+    if msg is None:
+        return ""
+    if isinstance(msg, dict):
+        return msg.get("content") or ""
+    return getattr(msg, "content", "") or ""
+
+
+def _needs_fallback(user_text: str, reply_text: str, gate_metrics: dict) -> bool:
+    if not reply_text:
+        return True
+    lower = reply_text.lower()
+    if any(p in lower for p in _UNCERTAIN_PHRASES):
+        return True
+    query_lower = (user_text or "").lower()
+    if any(k in query_lower for k in ("code", "token", "key", "id")):
+        if not _CODE_PATTERN.search(reply_text):
+            if not (_HAS_DIGIT.search(reply_text) or _HAS_UPPER_SEQ.search(reply_text)):
+                return True
+    if gate_metrics.get("weak_retrieval") and (gate_metrics.get("is_recall") or gate_metrics.get("is_complex")):
+        return True
+    return False
 
 
 def _window_messages(msgs, first=10, last=10):
@@ -372,6 +414,159 @@ async def process_and_stream_response(
 
     if rag_payload:
         await websocket.send_text(f"RAG:{json.dumps(rag_payload)}")
+
+    if not is_deep_mode and RLM_FALLBACK_ENABLED and not generate_audio:
+        model_name = get_current_model()
+        log_console(f"Using model: {model_name} | Deep: {is_deep_mode}", "AI")
+        metrics["_llm_start"] = time.time()
+
+        try:
+            base_resp = await asyncio.to_thread(
+                client.chat.completions.create,
+                model=model_name,
+                messages=current_messages,
+                temperature=0.7,
+                stream=False,
+            )
+            base_msg = _msg_to_dict(base_resp.choices[0].message)
+            base_text = base_msg.get("content") or _extract_message_text(base_resp.choices[0].message)
+        except Exception as exc:
+            base_text = ""
+            if DEBUG_MODE:
+                log_console(f"Base completion failed: {exc}", "ERR")
+
+        fallback_reason = None
+        if _needs_fallback(user_text, base_text, gate_decision.metrics or {}):
+            fallback_reason = "answer_inadequate"
+            await websocket.send_text("SYS:THINKING: Entering Deep Mode...")
+            deep_messages = [
+                {"role": "system", "content": "You are Simon (Deep Mode). Use your tools to verify facts from memory/history before answering. Do not hallucinate."},
+                *history[-10:],
+                {"role": "user", "content": user_text}
+            ]
+            tool_chars_used = 0
+            turn_count = 0
+            while turn_count < AGENT_MAX_TURNS and not stop_event.is_set():
+                turn_count += 1
+                try:
+                    response = await asyncio.to_thread(
+                        client.chat.completions.create,
+                        model=model_name,
+                        messages=deep_messages,
+                        temperature=0.7,
+                        stream=False,
+                        tools=tools.SIMON_TOOLS,
+                        tool_choice="auto",
+                    )
+                except Exception as exc:
+                    if DEBUG_MODE:
+                        log_console(f"Agent Loop Error: {exc}", "ERR")
+                    break
+
+                msg_dict = _msg_to_dict(response.choices[0].message)
+                tool_calls = msg_dict.get("tool_calls") or []
+                if tool_calls:
+                    deep_messages.append(msg_dict)
+                    await websocket.send_text("SYS:THINKING: Consulting memory...")
+                    for tool_call in tool_calls:
+                        fn = tool_call.get("function") or {}
+                        fn_name = fn.get("name") or tool_call.get("name")
+                        args = tools._safe_args(fn.get("arguments"))
+                        result = "Error: Unknown tool"
+
+                        if fn_name == "search_memory":
+                            query = args.get("query", "")
+                            scope = args.get("scope", "recent")
+                            result = tools.tool_search_memory(
+                                query,
+                                scope,
+                                session_id,
+                                memory=memory,
+                                mem_conn=db.mem_conn,
+                                db_lock=db.db_lock,
+                            )
+                        elif fn_name == "analyze_deep_context":
+                            await websocket.send_text("SYS:THINKING: Deep reading transcript...")
+                            target_session = args.get("session_id")
+                            instruction = args.get("instruction", "")
+                            if target_session is None or not instruction:
+                                result = "Error: analyze_deep_context requires session_id and instruction."
+                            else:
+                                result = tools.tool_analyze_deep(
+                                    client,
+                                    get_current_model,
+                                    target_session,
+                                    instruction,
+                                )
+
+                        result_str = str(result)
+                        remain = MAX_TOOL_OUTPUT_CHARS - tool_chars_used
+                        if remain <= 0:
+                            result_str = "[TOOL_BUDGET_EXCEEDED]"
+                        else:
+                            result_str = result_str[:remain]
+                        tool_chars_used += len(result_str)
+
+                        tool_call_id = tool_call.get("id") or tool_call.get("tool_call_id")
+                        tool_msg = {"role": "tool", "tool_call_id": tool_call_id, "content": result_str}
+                        deep_messages.append(tool_msg)
+                else:
+                    break
+
+            try:
+                final_messages = deep_messages + [{
+                    "role": "system",
+                    "content": "Now produce the final answer for the user. Do not call tools."
+                }]
+                final_resp = await asyncio.to_thread(
+                    client.chat.completions.create,
+                    model=model_name,
+                    messages=final_messages,
+                    temperature=0.7,
+                    stream=False,
+                )
+                final_msg = _msg_to_dict(final_resp.choices[0].message)
+                full_reply = final_msg.get("content") or _extract_message_text(final_resp.choices[0].message)
+            except Exception as exc:
+                full_reply = base_text
+                if DEBUG_MODE:
+                    log_console(f"Deep completion failed: {exc}", "ERR")
+        else:
+            full_reply = base_text
+
+        metrics["rlm_fallback"] = {
+            "trigger": fallback_reason is not None,
+            "reason": fallback_reason or "base_ok",
+        }
+        if isinstance(metrics.get("rlm_gate"), dict):
+            metrics["rlm_gate"]["fallback_reason"] = fallback_reason or "base_ok"
+        metrics["llm_total"] = time.time() - metrics["_llm_start"]
+
+        if full_reply:
+            metrics["output_chars"] = len(full_reply)
+            if metrics.get("output_tokens") is None:
+                metrics["output_tokens"] = estimate_tokens_from_text(full_reply)
+            history.append({"role": "user", "content": user_text})
+            history.append({"role": "assistant", "content": full_reply})
+
+            if memory_intents.detect_memory_save(user_text):
+                history_snapshot = list(history)
+                threading.Thread(
+                    target=_save_explicit_memory,
+                    args=(history_snapshot, session_id, client, get_current_model, memory),
+                ).start()
+            threading.Thread(target=db.save_interaction, args=(session_id, user_text, full_reply)).start()
+
+            metrics["end_time"] = time.time()
+            _print_perf_report(metrics)
+            finalize_metrics(metrics, "ok")
+            await websocket.send_text(f"LOG:AI: {full_reply}")
+            await websocket.send_text("DONE")
+        else:
+            metrics["end_time"] = time.time()
+            finalize_metrics(metrics, "empty_reply")
+            await websocket.send_text("DONE")
+        return
 
     emit_text_deltas = not generate_audio
     emit_final_text = True

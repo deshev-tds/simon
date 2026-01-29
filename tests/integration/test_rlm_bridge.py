@@ -137,8 +137,8 @@ def test_bridge_multi_hop_reasoning(app_client, server):
     tool_msgs = [m for m in messages if "Consulting memory" in m]
     assert tool_msgs, "Expected search_memory tool usage in deep mode."
 
-    assert target_code in ai_reply_clean, (
-        f"Bridge failed. Expected {target_code}, got '{ai_reply_clean}'."
+    assert ai_reply_clean == target_code, (
+        f"Bridge failed. Expected '{target_code}', got '{ai_reply_clean}'."
     )
 
     with server.METRICS_LOCK:

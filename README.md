@@ -122,6 +122,7 @@ Simon uses an explicit gate to decide when to pay the latency cost of deep/recur
 
 **Env knobs:**
 - `SIMON_RLM_ENABLED` (default `1`)
+- `SIMON_RLM_FALLBACK_ENABLED` (default `1`)
 - `SIMON_RLM_MAX_DEBT_RATIO` (default `2.5`)
 - `SIMON_RLM_MIN_DEBT_FOR_CHECK` (default `1.2`)
 - `SIMON_RLM_RECENT_WINDOW_TURNS` (default `6`)
