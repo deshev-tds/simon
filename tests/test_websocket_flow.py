@@ -57,15 +57,20 @@ def test_websocket_synthetic_flow(app_client, server):
                     "SELECT COUNT(1) FROM messages WHERE session_id=?",
                     (session_id,)
                 ).fetchone()[0]
-            return disk_count >= total_messages * 2 and mem_count >= total_messages * 2
+            hot_limit = server.db.MEM_HOT_SESSION_LIMIT
+            return disk_count >= total_messages * 2 and mem_count > 0 and mem_count <= hot_limit
 
         assert wait_for_condition(counts_ok, timeout_s=10.0)
+
+        keep_turns = max(1, server.db.MEM_HOT_SESSION_LIMIT // 2)
+        expected_turn = max(1, total_messages - min(5, keep_turns - 1))
+        keep_token = f"TOKEN{expected_turn:04d}"
 
         def token_present():
             with server.db_lock:
                 row = server.mem_conn.execute(
                     "SELECT 1 FROM messages WHERE session_id=? AND content LIKE ?",
-                    (session_id, "%TOKEN0001%")
+                    (session_id, f"%{keep_token}%")
                 ).fetchone()
             return row is not None
 

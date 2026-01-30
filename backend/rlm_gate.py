@@ -22,6 +22,10 @@ _RE_COMPLEX = re.compile(
     r"\b(connection|relation|difference|compare|summary|timeline|trace|сравни|връзка)\b",
     re.IGNORECASE,
 )
+_RE_HIGH_RISK = re.compile(
+    r"\b(code|token|key|password|auth|authentication|api key|access code|pin)\b",
+    re.IGNORECASE,
+)
 
 _STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from",
@@ -91,6 +95,7 @@ class RLMGatekeeper:
 
         is_recall = bool(_RE_RECALL.search(query))
         is_complex = bool(_RE_COMPLEX.search(query))
+        is_high_risk = bool(_RE_HIGH_RISK.search(query))
 
         if query_len < RLM_MIN_QUERY_LEN and not is_recall and not is_complex:
             return GateDecision(False, "query_too_short", {"query_len": query_len})
@@ -116,6 +121,7 @@ class RLMGatekeeper:
             "query_len": query_len,
             "is_recall": is_recall,
             "is_complex": is_complex,
+            "is_high_risk": is_high_risk,
             "weak_retrieval": is_weak_retrieval,
         }
 
@@ -124,6 +130,9 @@ class RLMGatekeeper:
 
         if (is_recall or is_complex) and (debt_ratio >= RLM_MIN_DEBT_FOR_CHECK or is_weak_retrieval):
             return GateDecision(True, "complex_intent_with_context_gap", metrics)
+
+        if is_high_risk and is_weak_retrieval:
+            return GateDecision(True, "high_risk_with_gap", metrics)
 
         if (
             debt_ratio >= RLM_MIN_DEBT_FOR_CHECK

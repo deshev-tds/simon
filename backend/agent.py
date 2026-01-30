@@ -17,6 +17,9 @@ from backend.config import (
     MAX_TOOL_OUTPUT_CHARS,
     QUIET_LOGS,
     RLM_FALLBACK_ENABLED,
+    RLM_MAX_HOPS,
+    RLM_DEEP_HISTORY_MAX_MSGS,
+    RLM_DEEP_HISTORY_MAX_CHARS,
     SKIP_VECTOR_MEMORY,
     TTS_VOICE,
 )
@@ -47,14 +50,307 @@ _UNCERTAIN_PHRASES = (
     "i'm not sure",
     "im not sure",
 )
-_CODE_PATTERN = re.compile(r"\b[A-Z0-9]{2,}[-_][A-Z0-9]{2,}\b|\b[A-Z0-9]{6,}\b")
+_CODE_PATTERN = re.compile(
+    r"\b(?:[A-Z0-9]{2,}[-_][A-Z0-9]{2,}|[A-Z0-9]*\d[A-Z0-9_-]*)\b"
+)
 _HAS_DIGIT = re.compile(r"\d")
 _HAS_UPPER_SEQ = re.compile(r"[A-Z]{2,}")
-_CODE_INTENT = ("code", "token", "key", "id")
+_CODE_INTENT = ("code", "token", "key", "id", "auth", "authentication", "password", "api key", "access code", "pin")
 _BRIDGE_STOPWORDS = {
     "the", "a", "an", "this", "that", "these", "those", "project", "protocol",
     "update", "confidential", "log", "entry", "alpha", "beta", "uses", "code",
 }
+
+_PERSON_STOPWORDS = {
+    "project", "protocol", "system", "session", "report", "note", "the", "today",
+    "yesterday", "this", "that", "these", "those", "log", "entry", "stage",
+    "alpha", "beta", "omega",
+}
+_TITLE_PATTERN = re.compile(r"^(?:Mr\.|Ms\.|Mrs\.|Dr\.)\s+", re.I)
+_PERSON_PATTERN = re.compile(r"\b(?:Mr\.|Ms\.|Mrs\.|Dr\.)?\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b")
+_CITY_PATTERN = re.compile(r"\b(?:in|at|from|near|to)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b")
+
+_DEEP_SYSTEM_PROMPT = (
+    "You are Simon (Deep Mode). You MUST call search_memory before answering. "
+    "Use scope='global' unless the user explicitly asks about the current session. "
+    "Answer ONLY from tool evidence above. If no evidence is found, reply exactly: not found. "
+    "Do not hallucinate."
+)
+
+_EVIDENCE_PATTERNS = {
+    "code": _CODE_PATTERN,
+    "date": re.compile(r"\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4})\b"),
+    "amount": re.compile(r"\b(?:\$|usd|eur|gbp)?\s?\d+(?:\.\d+)?\b", re.I),
+    "email": re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I),
+    "phone": re.compile(r"\+?\d[\d\s\-]{6,}\d"),
+    "formula": re.compile(r"\b(?:[A-Z][a-z]?\d*){2,}\b"),
+}
+
+_EVIDENCE_INTENT_MAP = {
+    "code": {"code", "token", "key", "id", "auth", "authentication", "password", "api key", "access code", "pin"},
+    "date": {"date", "when", "deadline", "due", "timestamp"},
+    "amount": {"price", "cost", "budget", "amount", "total", "usd", "$", "eur", "gbp"},
+    "email": {"email", "e-mail", "mail"},
+    "phone": {"phone", "call", "number"},
+    "name": {"name", "named", "called", "who", "whose", "person", "sister", "brother", "father", "mother", "boss", "leader"},
+    "city": {"city", "town", "capital"},
+    "formula": {"formula", "chemical", "compound"},
+}
+
+_EVIDENCE_QUERY_HINT = {
+    "code": "authentication code",
+    "date": "date",
+    "amount": "amount",
+    "email": "email",
+    "phone": "phone",
+    "name": "name",
+    "city": "city",
+    "formula": "formula",
+}
+
+
+def _evidence_types_for_query(query: str) -> list[str]:
+    q = (query or "").lower()
+    words = set(re.findall(r"\b\w+\b", q))
+    types = []
+    for kind, tokens in _EVIDENCE_INTENT_MAP.items():
+        hit = False
+        for tok in tokens:
+            if " " in tok:
+                if tok in q:
+                    hit = True
+                    break
+            else:
+                if tok in words:
+                    hit = True
+                    break
+        if hit:
+            types.append(kind)
+    return types
+
+
+def _missing_evidence_types(user_text: str, evidence_reason: str) -> list[str]:
+    if evidence_reason.startswith("missing_evidence:"):
+        payload = evidence_reason.split("missing_evidence:", 1)[1]
+        return [p for p in payload.split(",") if p]
+    if evidence_reason in ("no_evidence_lines", "no_tool_calls"):
+        return _evidence_types_for_query(user_text)
+    return []
+
+
+def _parse_evidence_json(text: str) -> dict | None:
+    for line in str(text).splitlines():
+        if line.startswith("EVIDENCE_JSON:"):
+            payload_str = line.split("EVIDENCE_JSON:", 1)[1].strip()
+            if not payload_str:
+                return None
+            try:
+                return json.loads(payload_str)
+            except Exception:
+                return None
+    return None
+
+
+def _evidence_items_to_lines(items: list[dict]) -> list[str]:
+    lines = []
+    for item in items:
+        text = (item.get("text") or "").strip()
+        if not text:
+            continue
+        source_type = (item.get("source_type") or "unknown").upper()
+        ts = item.get("ts")
+        ts_label = f"ts={ts}" if ts else "ts=?"
+        lines.append(f"[{source_type}] ({ts_label}): {text[:150]}...")
+    return lines
+
+
+def _line_to_item(line: str) -> dict:
+    source_type = "unknown"
+    match = re.match(r"^\[([A-Z]+)\]", line)
+    if match:
+        source_type = match.group(1).lower()
+    return {
+        "source_type": source_type,
+        "doc_id": None,
+        "ts": _parse_evidence_ts(line),
+        "text": _normalize_evidence_line(line),
+        "score": None,
+        "distance": None,
+    }
+
+
+def _extract_evidence_items(tool_texts: list[str]) -> tuple[list[dict], list[str]]:
+    items: list[dict] = []
+    lines: list[str] = []
+    for text in tool_texts:
+        payload = _parse_evidence_json(text)
+        if payload:
+            payload_items = payload.get("items") or payload.get("evidence") or []
+            payload_lines = payload.get("lines") or []
+            if isinstance(payload_items, list):
+                items.extend(payload_items)
+            if isinstance(payload_lines, list):
+                lines.extend([l for l in payload_lines if isinstance(l, str)])
+            if payload_items and not payload_lines:
+                lines.extend(_evidence_items_to_lines(payload_items))
+            continue
+        for line in str(text).splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("["):
+                lines.append(line)
+                items.append(_line_to_item(line))
+    return items, lines
+
+
+def _normalize_evidence_line(line: str) -> str:
+    cleaned = re.sub(r"^\[[^\]]+\]\s*", "", line)
+    cleaned = re.sub(r"^\([^)]+\):\s*", "", cleaned)
+    return cleaned.strip()
+
+
+def _parse_evidence_ts(line: str) -> int:
+    match = re.search(r"ts=(\d+)", line)
+    if not match:
+        return 0
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _extract_person_name(line: str, query_lower: str) -> str | None:
+    candidates = []
+    for match in _PERSON_PATTERN.finditer(line):
+        name = match.group(0).strip()
+        name = _TITLE_PATTERN.sub("", name)
+        name = name.replace("'s", "")
+        tokens = [t for t in name.split() if t]
+        if not tokens:
+            continue
+        if any(t.lower() in _PERSON_STOPWORDS for t in tokens):
+            continue
+        if name.lower() in query_lower:
+            continue
+        candidates.append(name)
+    if not candidates:
+        return None
+    return candidates[-1]
+
+
+def _extract_city_name(line: str) -> str | None:
+    match = _CITY_PATTERN.search(line)
+    if not match:
+        return None
+    city = match.group(1).strip()
+    tokens = [t for t in city.split() if t]
+    if tokens and any(t.lower() in _PERSON_STOPWORDS for t in tokens):
+        return None
+    return city
+
+
+def _item_matches_kind(kind: str, text: str, query_lower: str) -> bool:
+    if kind == "name":
+        return _extract_person_name(text, query_lower) is not None
+    if kind == "city":
+        return _extract_city_name(text) is not None
+    pattern = _EVIDENCE_PATTERNS.get(kind)
+    if pattern is None:
+        return False
+    return pattern.search(text) is not None
+
+
+def _has_evidence_type(kind: str, evidence_items: list[dict], query_lower: str) -> bool:
+    for item in evidence_items:
+        cleaned = (item.get("text") or "").strip()
+        if _item_matches_kind(kind, cleaned, query_lower):
+            return True
+    return False
+
+
+def _evidence_check(user_text: str, tool_texts: list[str]) -> tuple[bool, str, list[dict], list[str], dict]:
+    evidence_items, evidence_lines = _extract_evidence_items(tool_texts)
+    required_types = _evidence_types_for_query(user_text)
+    matches = {}
+    query_lower = (user_text or "").lower()
+    for kind in required_types:
+        matches[kind] = _has_evidence_type(kind, evidence_items, query_lower)
+
+    if required_types:
+        for item in evidence_items:
+            cleaned = (item.get("text") or "").strip()
+            hits = {}
+            for kind in required_types:
+                hits[kind] = _item_matches_kind(kind, cleaned, query_lower)
+            if hits:
+                item["entity_hits"] = hits
+
+    if not evidence_items:
+        return False, "no_evidence_lines", evidence_items, evidence_lines, matches
+    if required_types:
+        missing = [k for k, ok in matches.items() if not ok]
+        if missing:
+            return False, f"missing_evidence:{','.join(missing)}", evidence_items, evidence_lines, matches
+    return True, "evidence_ok", evidence_items, evidence_lines, matches
+
+
+def _extract_evidence_value(kind: str, evidence_items: list[dict]) -> str | None:
+    candidates: list[tuple[int, int, str]] = []
+    if kind == "name":
+        for idx, item in enumerate(evidence_items):
+            cleaned = (item.get("text") or "").strip()
+            name = _extract_person_name(cleaned, "")
+            if name:
+                candidates.append((int(item.get("ts") or 0), idx, name))
+    elif kind == "city":
+        for idx, item in enumerate(evidence_items):
+            cleaned = (item.get("text") or "").strip()
+            city = _extract_city_name(cleaned)
+            if city:
+                candidates.append((int(item.get("ts") or 0), idx, city))
+    else:
+        pattern = _EVIDENCE_PATTERNS.get(kind)
+        if pattern is None:
+            return None
+        for idx, item in enumerate(evidence_items):
+            match = pattern.search((item.get("text") or "").strip())
+            if match:
+                candidates.append((int(item.get("ts") or 0), idx, match.group(0)))
+
+    if not candidates:
+        return None
+
+    if any(ts > 0 for ts, _, _ in candidates):
+        candidates.sort(key=lambda c: (c[0], c[1]))
+        return candidates[-1][2]
+    candidates.sort(key=lambda c: c[1])
+    return candidates[-1][2]
+
+
+def _enforce_evidence_answer(user_text: str, evidence_items: list[dict]) -> tuple[str | None, str | None]:
+    required = _evidence_types_for_query(user_text)
+    if not required:
+        return None, None
+    for kind in required:
+        value = _extract_evidence_value(kind, evidence_items)
+        if value:
+            return value, f"extracted_{kind}"
+    return "not found", "forced_not_found"
+
+
+def _force_tool_call(user_text: str, session_id: int, memory, metrics: dict):
+    query = user_text or ""
+    result = tools.tool_search_memory(
+        query,
+        scope="global",
+        session_id=session_id,
+        memory=memory,
+        db_lock=db.db_lock,
+    )
+    metrics.setdefault("rlm_forced_tool", [])
+    metrics["rlm_forced_tool"].append({"query": query})
+    return result
 
 
 def _extract_bridge_candidates(text: str, query_lower: str) -> list[str]:
@@ -82,10 +378,12 @@ def _maybe_auto_hop(user_text: str, tool_text: str, session_id: int, memory, met
     query_lower = (user_text or "").lower()
     if not any(k in query_lower for k in _CODE_INTENT):
         return None
-    if _CODE_PATTERN.search(tool_text):
+    items, _ = _extract_evidence_items([tool_text])
+    bridge_text = "\n".join([i.get("text", "") for i in items]) if items else tool_text
+    if _CODE_PATTERN.search(bridge_text):
         return None
 
-    candidates = _extract_bridge_candidates(tool_text, query_lower)
+    candidates = _extract_bridge_candidates(bridge_text, query_lower)
     if not candidates:
         return None
 
@@ -94,15 +392,88 @@ def _maybe_auto_hop(user_text: str, tool_text: str, session_id: int, memory, met
     hop_query = f"{bridge} {keyword}"
     result = tools.tool_search_memory(
         hop_query,
-        scope="session",
+        scope="global",
         session_id=session_id,
         memory=memory,
-        mem_conn=db.mem_conn,
         db_lock=db.db_lock,
     )
     metrics.setdefault("rlm_autohop", [])
     metrics["rlm_autohop"].append({"query": hop_query, "bridge": bridge})
     return {"query": hop_query, "result": result}
+
+
+def _apply_hops(
+    user_text: str,
+    session_id: int,
+    memory,
+    metrics: dict,
+    current_messages: list,
+    all_tool_texts: list,
+    tool_chars_used: int,
+    evidence_ok: bool,
+    evidence_reason: str,
+    evidence_items: list[dict],
+    evidence_lines: list[str],
+    evidence_matches: dict,
+):
+    if evidence_ok or RLM_MAX_HOPS <= 0:
+        return evidence_ok, evidence_reason, evidence_items, evidence_lines, evidence_matches, tool_chars_used
+
+    missing = _missing_evidence_types(user_text, evidence_reason)
+    if not missing:
+        return evidence_ok, evidence_reason, evidence_items, evidence_lines, evidence_matches, tool_chars_used
+
+    seen_bridges = set()
+    prev_missing = set(missing)
+    prev_lines = len(evidence_lines)
+    hop_count = 0
+
+    while hop_count < RLM_MAX_HOPS and missing:
+        candidates = _extract_bridge_candidates("\n".join(all_tool_texts), (user_text or "").lower())
+        bridge = next((c for c in candidates if c.lower() not in seen_bridges), None)
+        if not bridge:
+            break
+        seen_bridges.add(bridge.lower())
+
+        hint = _EVIDENCE_QUERY_HINT.get(missing[0], missing[0])
+        hop_query = f"{bridge} {hint}".strip()
+        hop_result = tools.tool_search_memory(
+            hop_query,
+            scope="global",
+            session_id=session_id,
+            memory=memory,
+            db_lock=db.db_lock,
+        )
+        metrics.setdefault("rlm_hops", [])
+        metrics["rlm_hops"].append({"bridge": bridge, "query": hop_query})
+
+        result_str = str(hop_result)
+        remain = MAX_TOOL_OUTPUT_CHARS - tool_chars_used
+        if remain <= 0:
+            result_str = "[TOOL_BUDGET_EXCEEDED]"
+        else:
+            result_str = result_str[:remain]
+        tool_chars_used += len(result_str)
+        all_tool_texts.append(result_str)
+        current_messages.append({
+            "role": "tool",
+            "tool_call_id": f"hop-{hop_count + 1}",
+            "content": result_str,
+        })
+        hop_count += 1
+
+        evidence_ok, evidence_reason, evidence_items, evidence_lines, evidence_matches = _evidence_check(
+            user_text, all_tool_texts
+        )
+        if evidence_ok:
+            break
+        missing = _missing_evidence_types(user_text, evidence_reason)
+        if len(evidence_lines) <= prev_lines and set(missing) == prev_missing:
+            break
+        prev_lines = len(evidence_lines)
+        prev_missing = set(missing)
+
+    return evidence_ok, evidence_reason, evidence_items, evidence_lines, evidence_matches, tool_chars_used
 
 
 def _extract_message_text(msg):
@@ -135,6 +506,20 @@ def _window_messages(msgs, first=10, last=10):
     return msgs[:first] + msgs[-last:]
 
 
+def _select_deep_history(history: list[dict]) -> list[dict]:
+    if not history or RLM_DEEP_HISTORY_MAX_MSGS <= 0:
+        return []
+    trimmed = []
+    for msg in reversed(history):
+        content = (msg.get("content") or "")
+        if len(content) > RLM_DEEP_HISTORY_MAX_CHARS:
+            continue
+        trimmed.append(msg)
+        if len(trimmed) >= RLM_DEEP_HISTORY_MAX_MSGS:
+            break
+    return list(reversed(trimmed))
+
+
 def _estimate_window_tokens(history):
     if not history:
         return 0
@@ -153,7 +538,7 @@ def _probe_retrieval(user_text, memory, session_id):
             user_text,
             session_id=session_id,
             limit=FTS_MAX_HITS,
-            conn=db.mem_conn,
+            conn=db.db_conn,
             lock=db.db_lock,
         )
     except Exception:
@@ -442,9 +827,10 @@ async def process_and_stream_response(
     if is_deep_mode:
         log_console("ACTIVATING AGENTIC LOOP", "AGENT")
         await websocket.send_text("SYS:THINKING: Entering Deep Mode...")
+        deep_history = _select_deep_history(history)
         current_messages = [
-            {"role": "system", "content": "You are Simon (Deep Mode). Use your tools to verify facts from memory/history before answering. Do not hallucinate."},
-            *history[-10:],
+            {"role": "system", "content": _DEEP_SYSTEM_PROMPT},
+            *deep_history,
             {"role": "user", "content": user_text}
         ]
         tools_list = tools.SIMON_TOOLS
@@ -492,14 +878,17 @@ async def process_and_stream_response(
         if _needs_fallback(user_text, base_text, gate_decision.metrics or {}):
             fallback_reason = "answer_inadequate"
             await websocket.send_text("SYS:THINKING: Entering Deep Mode...")
+            deep_history = _select_deep_history(history)
             deep_messages = [
-                {"role": "system", "content": "You are Simon (Deep Mode). Use your tools to verify facts from memory/history before answering. Do not hallucinate."},
-                *history[-10:],
+                {"role": "system", "content": _DEEP_SYSTEM_PROMPT},
+                *deep_history,
                 {"role": "user", "content": user_text}
             ]
             tool_chars_used = 0
             turn_count = 0
             auto_hop_used = False
+            tool_calls_made = False
+            all_tool_texts = []
             while turn_count < AGENT_MAX_TURNS and not stop_event.is_set():
                 turn_count += 1
                 try:
@@ -520,6 +909,7 @@ async def process_and_stream_response(
                 msg_dict = _msg_to_dict(response.choices[0].message)
                 tool_calls = msg_dict.get("tool_calls") or []
                 if tool_calls:
+                    tool_calls_made = True
                     deep_messages.append(msg_dict)
                     await websocket.send_text("SYS:THINKING: Consulting memory...")
                     tool_texts = []
@@ -537,7 +927,6 @@ async def process_and_stream_response(
                                 scope,
                                 session_id,
                                 memory=memory,
-                                mem_conn=db.mem_conn,
                                 db_lock=db.db_lock,
                             )
                         elif fn_name == "analyze_deep_context":
@@ -566,6 +955,7 @@ async def process_and_stream_response(
                         tool_call_id = tool_call.get("id") or tool_call.get("tool_call_id")
                         tool_msg = {"role": "tool", "tool_call_id": tool_call_id, "content": result_str}
                         deep_messages.append(tool_msg)
+                    all_tool_texts.extend(tool_texts)
                     if not auto_hop_used and tool_texts:
                         hop = _maybe_auto_hop(
                             user_text,
@@ -583,23 +973,83 @@ async def process_and_stream_response(
                                 "content": str(hop["result"]),
                             }
                             deep_messages.append(hop_msg)
+                            all_tool_texts.append(str(hop["result"]))
                 else:
                     break
 
             try:
-                final_messages = deep_messages + [{
-                    "role": "system",
-                    "content": "Now produce the final answer for the user. Do not call tools."
-                }]
-                final_resp = await asyncio.to_thread(
-                    client.chat.completions.create,
-                    model=model_name,
-                    messages=final_messages,
-                    temperature=0.7,
-                    stream=False,
+                if not tool_calls_made:
+                    await websocket.send_text("SYS:THINKING: Consulting memory...")
+                    forced = _force_tool_call(user_text, session_id, memory, metrics)
+                    tool_calls_made = True
+                    forced_text = str(forced)
+                    all_tool_texts.append(forced_text)
+                    deep_messages.append({
+                        "role": "tool",
+                        "tool_call_id": "forced-tool",
+                        "content": forced_text[:MAX_TOOL_OUTPUT_CHARS],
+                    })
+
+                evidence_ok, evidence_reason, evidence_items, evidence_lines, evidence_matches = _evidence_check(user_text, all_tool_texts)
+                evidence_ok, evidence_reason, evidence_items, evidence_lines, evidence_matches, tool_chars_used = _apply_hops(
+                    user_text,
+                    session_id,
+                    memory,
+                    metrics,
+                    deep_messages,
+                    all_tool_texts,
+                    tool_chars_used,
+                    evidence_ok,
+                    evidence_reason,
+                    evidence_items,
+                    evidence_lines,
+                    evidence_matches,
                 )
-                final_msg = _msg_to_dict(final_resp.choices[0].message)
-                full_reply = final_msg.get("content") or _extract_message_text(final_resp.choices[0].message)
+                metrics["evidence"] = {
+                    "ok": evidence_ok,
+                    "reason": evidence_reason,
+                    "lines": evidence_lines[:10],
+                    "items": evidence_items[:10],
+                    "matches": evidence_matches,
+                    "tool_calls": tool_calls_made or bool(metrics.get("rlm_hops")),
+                }
+                if not (tool_calls_made or metrics.get("rlm_hops")):
+                    evidence_ok = False
+                    evidence_reason = "no_tool_calls"
+                    metrics["evidence"]["ok"] = False
+                    metrics["evidence"]["reason"] = evidence_reason
+
+                if not evidence_ok:
+                    full_reply = "not found"
+                else:
+                    enforced_value, enforced_reason = _enforce_evidence_answer(user_text, evidence_items)
+                    if enforced_reason:
+                        metrics["evidence"]["enforced"] = enforced_reason
+                        full_reply = enforced_value or "not found"
+                    else:
+                        evidence_block = "\n".join(evidence_lines[:10])
+                        final_messages = deep_messages + [{
+                            "role": "system",
+                            "content": (
+                                "Answer ONLY from the tool evidence above. "
+                                "Cite evidence verbatim in your reasoning if needed. "
+                                "If evidence is missing, reply exactly: not found."
+                            )
+                        }]
+                        if evidence_block:
+                            final_messages.append({
+                                "role": "system",
+                                "content": f"EVIDENCE LINES:\n{evidence_block}",
+                            })
+                        final_resp = await asyncio.to_thread(
+                            client.chat.completions.create,
+                            model=model_name,
+                            messages=final_messages,
+                            temperature=0.2,
+                            stream=False,
+                        )
+                        final_msg = _msg_to_dict(final_resp.choices[0].message)
+                        full_reply = final_msg.get("content") or _extract_message_text(final_resp.choices[0].message)
             except Exception as exc:
                 full_reply = base_text
                 if DEBUG_MODE:
@@ -719,6 +1169,8 @@ async def process_and_stream_response(
             if is_deep_mode:
                 turn_count = 0
                 auto_hop_used = False
+                tool_calls_made = False
+                all_tool_texts = []
                 while turn_count < AGENT_MAX_TURNS and not stop_evt.is_set():
                     turn_count += 1
 
@@ -738,6 +1190,7 @@ async def process_and_stream_response(
                     msg_dict = _msg_to_dict(response.choices[0].message)
                     tool_calls = msg_dict.get("tool_calls") or []
                     if tool_calls:
+                        tool_calls_made = True
                         current_messages.append(msg_dict)
                         first_tool = tool_calls[0] if tool_calls else {}
                         first_fn = (first_tool.get("function") or {}).get("name") or first_tool.get("name")
@@ -763,7 +1216,6 @@ async def process_and_stream_response(
                                     scope,
                                     session_id,
                                     memory=memory,
-                                    mem_conn=db.mem_conn,
                                     db_lock=db.db_lock,
                                 )
                             elif fn_name == "analyze_deep_context":
@@ -795,6 +1247,7 @@ async def process_and_stream_response(
                             tool_call_id = tool_call.get("id") or tool_call.get("tool_call_id")
                             tool_msg = {"role": "tool", "tool_call_id": tool_call_id, "content": result_str}
                             current_messages.append(tool_msg)
+                        all_tool_texts.extend(tool_texts)
 
                         if not auto_hop_used and tool_texts:
                             hop = _maybe_auto_hop(
@@ -816,77 +1269,139 @@ async def process_and_stream_response(
                                     "content": str(hop["result"]),
                                 }
                                 current_messages.append(hop_msg)
+                                all_tool_texts.append(str(hop["result"]))
                     else:
                         break
 
             if not stop_evt.is_set():
                 try:
                     final_messages = current_messages
+                    evidence_ok = True
+                    evidence_items = []
+                    evidence_lines = []
                     if is_deep_mode:
-                        final_messages = current_messages + [{
-                            "role": "system",
-                            "content": "Now produce the final answer for the user. Do not call tools."
-                        }]
+                        if not tool_calls_made:
+                            asyncio.run_coroutine_threadsafe(
+                                websocket.send_text("SYS:THINKING: Consulting memory..."),
+                                loop,
+                            )
+                            forced = _force_tool_call(user_text, session_id, memory, metrics)
+                            tool_calls_made = True
+                            forced_text = str(forced)
+                            all_tool_texts.append(forced_text)
+                            current_messages.append({
+                                "role": "tool",
+                                "tool_call_id": "forced-tool",
+                                "content": forced_text[:MAX_TOOL_OUTPUT_CHARS],
+                            })
 
-                    stream_start = time.time()
-                    stream = client.chat.completions.create(
-                        model=model_name,
-                        messages=final_messages,
-                        temperature=0.7,
-                        stream=True
-                    )
+                        evidence_ok, evidence_reason, evidence_items, evidence_lines, evidence_matches = _evidence_check(
+                            user_text, all_tool_texts
+                        )
+                        evidence_ok, evidence_reason, evidence_items, evidence_lines, evidence_matches, tool_chars_used = _apply_hops(
+                            user_text,
+                            session_id,
+                            memory,
+                            metrics,
+                            current_messages,
+                            all_tool_texts,
+                            tool_chars_used,
+                            evidence_ok,
+                            evidence_reason,
+                            evidence_items,
+                            evidence_lines,
+                            evidence_matches,
+                        )
+                        metrics["evidence"] = {
+                            "ok": evidence_ok,
+                            "reason": evidence_reason,
+                            "lines": evidence_lines[:10],
+                            "items": evidence_items[:10],
+                            "matches": evidence_matches,
+                            "tool_calls": tool_calls_made or bool(metrics.get("rlm_hops")),
+                        }
+                        if not (tool_calls_made or metrics.get("rlm_hops")):
+                            evidence_ok = False
+                            metrics["evidence"]["ok"] = False
+                            metrics["evidence"]["reason"] = "no_tool_calls"
 
-                    delta_buffer = ""
-                    last_flush = time.monotonic()
-                    current_sentence = ""
-                    for chunk in stream:
-                        if stop_evt.is_set():
-                            break
+                        if not evidence_ok:
+                            final_text_buffer = "not found"
+                        else:
+                            final_messages = current_messages + [{
+                                "role": "system",
+                                "content": (
+                                    "Answer ONLY from the tool evidence above. "
+                                    "If evidence is missing, reply exactly: not found. "
+                                    "Do not call tools."
+                                )
+                            }]
+                            if evidence_lines:
+                                final_messages.append({
+                                    "role": "system",
+                                    "content": f"EVIDENCE LINES:\n{chr(10).join(evidence_lines[:10])}",
+                                })
 
-                        choices = getattr(chunk, "choices", None)
-                        if choices is None and isinstance(chunk, dict):
-                            choices = chunk.get("choices")
-                        if not choices:
-                            continue
-                        choice0 = choices[0]
-                        delta = getattr(choice0, "delta", None)
-                        if delta is None and isinstance(choice0, dict):
-                            delta = choice0.get("delta")
-                        if not delta:
-                            continue
-                        token = getattr(delta, "content", None)
-                        if token is None and isinstance(delta, dict):
-                            token = delta.get("content")
-                        if not token:
-                            continue
-                        if metrics.get("ttft") is None:
-                            metrics["ttft"] = time.time() - stream_start
+                    if not is_deep_mode or evidence_ok:
+                        stream_start = time.time()
+                        stream = client.chat.completions.create(
+                            model=model_name,
+                            messages=final_messages,
+                            temperature=0.2 if is_deep_mode else 0.7,
+                            stream=True
+                        )
 
-                        final_text_buffer += token
-                        if emit_text_deltas:
-                            delta_buffer += token
-                            now = time.monotonic()
-                            if len(delta_buffer) >= STREAM_FLUSH_CHARS or (now - last_flush) >= STREAM_FLUSH_SECS:
-                                send_delta(delta_buffer)
-                                delta_buffer = ""
-                                last_flush = now
-                        if generate_audio:
-                            current_sentence += token
+                        delta_buffer = ""
+                        last_flush = time.monotonic()
+                        current_sentence = ""
+                        for chunk in stream:
+                            if stop_evt.is_set():
+                                break
 
-                        if generate_audio and sentence_endings.search(current_sentence[-2:]) and len(current_sentence.strip()) > 5:
+                            choices = getattr(chunk, "choices", None)
+                            if choices is None and isinstance(chunk, dict):
+                                choices = chunk.get("choices")
+                            if not choices:
+                                continue
+                            choice0 = choices[0]
+                            delta = getattr(choice0, "delta", None)
+                            if delta is None and isinstance(choice0, dict):
+                                delta = choice0.get("delta")
+                            if not delta:
+                                continue
+                            token = getattr(delta, "content", None)
+                            if token is None and isinstance(delta, dict):
+                                token = delta.get("content")
+                            if not token:
+                                continue
+                            if metrics.get("ttft") is None:
+                                metrics["ttft"] = time.time() - stream_start
+
+                            final_text_buffer += token
+                            if emit_text_deltas:
+                                delta_buffer += token
+                                now = time.monotonic()
+                                if len(delta_buffer) >= STREAM_FLUSH_CHARS or (now - last_flush) >= STREAM_FLUSH_SECS:
+                                    send_delta(delta_buffer)
+                                    delta_buffer = ""
+                                    last_flush = now
+                            if generate_audio:
+                                current_sentence += token
+
+                            if generate_audio and sentence_endings.search(current_sentence[-2:]) and len(current_sentence.strip()) > 5:
+                                raw_t = current_sentence.strip()
+                                clean_t = re.sub(r"[*#_`~]+", "", raw_t).strip()
+                                if clean_t:
+                                    enqueue_text(clean_t)
+                                current_sentence = ""
+
+                        if emit_text_deltas and delta_buffer and not stop_evt.is_set():
+                            send_delta(delta_buffer)
+                        if generate_audio and current_sentence.strip() and not stop_evt.is_set():
                             raw_t = current_sentence.strip()
                             clean_t = re.sub(r"[*#_`~]+", "", raw_t).strip()
                             if clean_t:
                                 enqueue_text(clean_t)
-                            current_sentence = ""
-
-                    if emit_text_deltas and delta_buffer and not stop_evt.is_set():
-                        send_delta(delta_buffer)
-                    if generate_audio and current_sentence.strip() and not stop_evt.is_set():
-                        raw_t = current_sentence.strip()
-                        clean_t = re.sub(r"[*#_`~]+", "", raw_t).strip()
-                        if clean_t:
-                            enqueue_text(clean_t)
 
                 except Exception as e:
                     print(f"Streaming Error: {e}")
@@ -921,6 +1436,17 @@ async def process_and_stream_response(
 
     if not stop_event.is_set():
         full_reply = response_holder["text"]
+        if is_deep_mode:
+            evidence = metrics.get("evidence") or {}
+            if evidence.get("ok") and evidence.get("items"):
+                enforced, reason = _enforce_evidence_answer(
+                    user_text,
+                    evidence.get("items", []),
+                )
+                if reason:
+                    evidence["enforced"] = reason
+                    metrics["evidence"] = evidence
+                    full_reply = enforced or "not found"
         if full_reply:
             metrics["output_chars"] = len(full_reply)
             if metrics.get("output_tokens") is None:

@@ -42,6 +42,7 @@ try:
 except Exception:
     INDEX_HTML = "<!doctype html><html><body><h1>Frontend not found</h1></body></html>"
 DB_PATH = DATA_DIR / "history.db"
+CORPUS_DB_PATH = DATA_DIR / "corpus.db"
 
 WHISPER_MODEL_NAME = "distil-medium.en"
 TTS_VOICE = "am_fenrir"
@@ -85,6 +86,7 @@ def _get_int_env(name: str, default: int) -> int:
 MEM_SEED_LIMIT = _get_int_env("SIMON_MEM_SEED_LIMIT", 50000)
 MEM_MAX_ROWS = _get_int_env("SIMON_MEM_MAX_ROWS", MEM_SEED_LIMIT)
 MEM_PRUNE_INTERVAL_S = _get_int_env("SIMON_MEM_PRUNE_INTERVAL_S", 60)
+MEM_HOT_SESSION_LIMIT = _get_int_env("SIMON_MEM_HOT_SESSION_LIMIT", 100)
 RAG_DEBUG_VERBOSE = _get_int_env("SIMON_RAG_DEBUG_VERBOSE", 0) > 0
 LLM_TIMEOUT_S = _get_int_env("SIMON_LLM_TIMEOUT_S", 0)
 LOCAL_WEAK_THRESHOLD = _get_float_env("SIMON_LOCAL_WEAK_THRESHOLD", 0.45)
@@ -117,6 +119,10 @@ RLM_RECENT_WINDOW_TURNS = _get_int_env("SIMON_RLM_RECENT_WINDOW_TURNS", 6)
 RLM_MIN_QUERY_LEN = _get_int_env("SIMON_RLM_MIN_QUERY_LEN", 20)
 RLM_VECTOR_WEAK_DIST = _get_float_env("SIMON_RLM_VECTOR_WEAK_DIST", 0.55)
 RLM_MIN_FTS_HITS = _get_int_env("SIMON_RLM_MIN_FTS_HITS", 1)
+RLM_MAX_HOPS = _get_int_env("SIMON_RLM_MAX_HOPS", 3)
+RLM_FTS_WEAK_SCORE = float(os.getenv("SIMON_RLM_FTS_WEAK_SCORE", "-1.0"))
+RLM_DEEP_HISTORY_MAX_MSGS = _get_int_env("SIMON_RLM_DEEP_HISTORY_MAX_MSGS", 2)
+RLM_DEEP_HISTORY_MAX_CHARS = _get_int_env("SIMON_RLM_DEEP_HISTORY_MAX_CHARS", 600)
 
 TEST_MODE = os.environ.get("SIMON_TEST_MODE") == "1"
 SKIP_AUDIO_MODELS = os.environ.get("SIMON_SKIP_AUDIO_MODELS") == "1"
@@ -141,6 +147,7 @@ __all__ = [
     "INDEX_HTML_PATH",
     "INDEX_HTML",
     "DB_PATH",
+    "CORPUS_DB_PATH",
     "WHISPER_MODEL_NAME",
     "TTS_VOICE",
     "DEFAULT_LLM_MODEL",
@@ -170,6 +177,7 @@ __all__ = [
     "MEM_SEED_LIMIT",
     "MEM_MAX_ROWS",
     "MEM_PRUNE_INTERVAL_S",
+    "MEM_HOT_SESSION_LIMIT",
     "RAG_DEBUG_VERBOSE",
     "LLM_TIMEOUT_S",
     "AGENT_MAX_TURNS",
@@ -183,6 +191,10 @@ __all__ = [
     "RLM_MIN_QUERY_LEN",
     "RLM_VECTOR_WEAK_DIST",
     "RLM_MIN_FTS_HITS",
+    "RLM_MAX_HOPS",
+    "RLM_FTS_WEAK_SCORE",
+    "RLM_DEEP_HISTORY_MAX_MSGS",
+    "RLM_DEEP_HISTORY_MAX_CHARS",
     "TEST_MODE",
     "SKIP_AUDIO_MODELS",
     "SKIP_VECTOR_MEMORY",

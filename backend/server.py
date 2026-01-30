@@ -134,6 +134,7 @@ current_model = DEFAULT_LLM_MODEL
 db_lock = db.db_lock
 db_conn = None
 mem_conn = None
+corpus_conn = None
 _ensure_fts5 = db._ensure_fts5
 
 
@@ -149,6 +150,12 @@ def init_mem_db():
     return mem_conn
 
 
+def init_corpus_db():
+    global corpus_conn
+    corpus_conn = db.init_corpus_db()
+    return corpus_conn
+
+
 db_conn = init_db()
 try:
     _ensure_fts5(db_conn)
@@ -157,6 +164,7 @@ except Exception as _e:
         print(f"[WARN] FTS5 setup failed: {_e}")
 
 mem_conn = init_mem_db()
+corpus_conn = init_corpus_db()
 _mem_threads_started = False
 
 
@@ -176,8 +184,7 @@ def start_mem_threads(stop_event=None):
     )
 
 
-if not TEST_MODE:
-    start_mem_threads()
+# Hot-session memdb is synced per-session; no global seed threads by default.
 
 create_session = db.create_session
 list_sessions = db.list_sessions
@@ -479,7 +486,7 @@ def build_rag_context(
                 user_text,
                 session_id=session_id,
                 limit=FTS_MAX_HITS,
-                conn=mem_conn,
+                conn=db_conn,
                 lock=db_lock,
             )
         except Exception:
@@ -792,6 +799,10 @@ async def websocket_endpoint(websocket: WebSocket):
     current_session_id = create_session(None)
     session_history = load_session_messages(current_session_id)
     try:
+        db.sync_mem_db_for_session(current_session_id, limit=MEM_HOT_SESSION_LIMIT, lock=db_lock)
+    except Exception as exc:
+        log_console(f"Hot memdb sync failed: {exc}", "WARN")
+    try:
         await websocket.send_text(f"SYS:SESSION:{current_session_id}")
     except Exception:
         pass
@@ -818,6 +829,10 @@ async def websocket_endpoint(websocket: WebSocket):
                                 new_id = create_session(None)
                             session_history = load_session_messages(new_id)
                             current_session_id = new_id
+                            try:
+                                db.sync_mem_db_for_session(current_session_id, limit=MEM_HOT_SESSION_LIMIT, lock=db_lock)
+                            except Exception as exc:
+                                log_console(f"Hot memdb sync failed: {exc}", "WARN")
                             await websocket.send_text(f"SYS:SESSION:{current_session_id}")
                         except Exception as e:
                             log_console(f"Session switch failed: {e}", "ERR")

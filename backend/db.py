@@ -6,6 +6,7 @@ import time
 from backend.config import (
     ANCHOR_MESSAGES,
     DB_PATH,
+    CORPUS_DB_PATH,
     DEBUG_MODE,
     FTS_MAX_HITS,
     FTS_MIN_TOKEN_LEN,
@@ -19,12 +20,15 @@ from backend.config import (
     MEM_MAX_ROWS,
     MEM_PRUNE_INTERVAL_S,
     MEM_SEED_LIMIT,
+    MEM_HOT_SESSION_LIMIT,
     TEST_MODE,
 )
 
 db_lock = threading.Lock()
 db_conn = None
 mem_conn = None
+corpus_conn = None
+mem_active_session_id = None
 
 _word_re = re.compile(r"\w+", re.UNICODE)
 _STOP_TOKENS = {
@@ -171,6 +175,58 @@ def _ensure_fts5(conn: sqlite3.Connection):
     return True
 
 
+def init_corpus_db(db_path=CORPUS_DB_PATH):
+    global corpus_conn
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.execute("PRAGMA foreign_keys = OFF;")
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT,
+            content TEXT NOT NULL,
+            tokens INTEGER DEFAULT 0,
+            created_at REAL DEFAULT (strftime('%s','now'))
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_created ON documents(created_at DESC)")
+
+    conn.execute("DROP TRIGGER IF EXISTS documents_ai")
+    conn.execute("DROP TRIGGER IF EXISTS documents_ad")
+    conn.execute("DROP TRIGGER IF EXISTS documents_au")
+    conn.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+            content,
+            source UNINDEXED,
+            tokenize='unicode61 remove_diacritics 2'
+        )
+    """)
+    conn.execute("""
+        CREATE TRIGGER documents_ai AFTER INSERT ON documents BEGIN
+            INSERT INTO documents_fts(rowid, content, source)
+            VALUES (new.id, new.content, new.source);
+        END;
+    """)
+    conn.execute("""
+        CREATE TRIGGER documents_ad AFTER DELETE ON documents BEGIN
+            DELETE FROM documents_fts WHERE rowid = old.id;
+        END;
+    """)
+    conn.execute("""
+        CREATE TRIGGER documents_au AFTER UPDATE OF content, source ON documents BEGIN
+            DELETE FROM documents_fts WHERE rowid = old.id;
+            INSERT INTO documents_fts(rowid, content, source)
+            VALUES (new.id, new.content, new.source);
+        END;
+    """)
+    conn.commit()
+    corpus_conn = conn
+    return conn
+
+
 def init_mem_db():
     global mem_conn
     conn = sqlite3.connect(
@@ -218,6 +274,65 @@ def init_mem_db():
             print(f"[WARN] In-memory FTS5 setup failed: {_e}")
     mem_conn = conn
     return conn
+
+
+def reset_mem_db(conn=None, lock=None):
+    global mem_active_session_id
+    target_conn = conn or mem_conn
+    if target_conn is None:
+        return
+    target_lock = _resolve_lock(lock)
+    with target_lock:
+        target_conn.execute("DELETE FROM messages")
+        target_conn.execute("DELETE FROM sessions")
+        target_conn.commit()
+    mem_active_session_id = None
+
+
+def seed_mem_db_for_session(
+    session_id: int,
+    limit: int = MEM_HOT_SESSION_LIMIT,
+    disk_conn=None,
+    mem_conn=None,
+    lock=None,
+):
+    if limit <= 0:
+        return
+    target_lock = _resolve_lock(lock)
+    target_mem = mem_conn if mem_conn is not None else globals().get("mem_conn")
+    if target_mem is None:
+        return
+    source_conn = disk_conn or db_conn
+    if source_conn is None:
+        return
+
+    with target_lock:
+        rows = source_conn.execute(
+            """
+            SELECT session_id, role, content, tokens, audio_path, created_at
+            FROM messages
+            WHERE session_id=?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (int(session_id), int(limit)),
+        ).fetchall()
+
+        if not rows:
+            return
+        rows = list(reversed(rows))
+        target_mem.executemany(
+            "INSERT INTO messages(session_id, role, content, tokens, audio_path, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        target_mem.commit()
+
+
+def sync_mem_db_for_session(session_id: int, limit: int = MEM_HOT_SESSION_LIMIT, lock=None):
+    global mem_active_session_id
+    reset_mem_db(lock=lock)
+    seed_mem_db_for_session(session_id, limit=limit, lock=lock)
+    mem_active_session_id = int(session_id)
 
 
 def seed_mem_db_from_disk(disk_conn, mem_conn, limit=MEM_SEED_LIMIT, batch_size=1000, seed_before_ts=None, lock=None):
@@ -330,6 +445,8 @@ def start_mem_threads(
     db_lock=None,
 ):
     if db_conn is None or mem_conn is None:
+        return None
+    if mem_seed_limit <= 0 and mem_max_rows <= 0:
         return None
     target_lock = _resolve_lock(db_lock)
     _mem_seed_before_ts = time.time()
@@ -463,7 +580,7 @@ def save_interaction(session_id, user_text, ai_text, conn=None, mem=None, lock=N
     ts = time.time()
     target_conn = _resolve_conn(conn)
     target_lock = _resolve_lock(lock)
-    target_mem = mem or mem_conn
+    target_mem = mem if mem is not None else mem_conn
     with target_lock:
         target_conn.execute(
             "INSERT INTO messages(session_id, role, content, tokens, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -476,6 +593,11 @@ def save_interaction(session_id, user_text, ai_text, conn=None, mem=None, lock=N
         target_conn.execute("UPDATE sessions SET updated_at=? WHERE id=?", (ts, session_id))
         target_conn.commit()
         if target_mem is not None:
+            allow_mem_write = mem is not None or (
+                mem_active_session_id is not None and int(session_id) == int(mem_active_session_id)
+            )
+            if not allow_mem_write:
+                return
             try:
                 target_mem.execute(
                     "INSERT INTO messages(session_id, role, content, tokens, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -486,6 +608,29 @@ def save_interaction(session_id, user_text, ai_text, conn=None, mem=None, lock=N
                     (session_id, "assistant", ai_text, 0, ts)
                 )
                 target_mem.commit()
+                if MEM_HOT_SESSION_LIMIT > 0:
+                    cur = target_mem.execute(
+                        "SELECT COUNT(1) FROM messages WHERE session_id=?",
+                        (int(session_id),),
+                    )
+                    count = cur.fetchone()[0] or 0
+                    if count > MEM_HOT_SESSION_LIMIT:
+                        cutoff_row = target_mem.execute(
+                            """
+                            SELECT created_at FROM messages
+                            WHERE session_id=?
+                            ORDER BY created_at DESC
+                            LIMIT 1 OFFSET ?
+                            """,
+                            (int(session_id), int(MEM_HOT_SESSION_LIMIT - 1)),
+                        ).fetchone()
+                        if cutoff_row:
+                            cutoff_ts = cutoff_row[0]
+                            target_mem.execute(
+                                "DELETE FROM messages WHERE session_id=? AND created_at < ?",
+                                (int(session_id), cutoff_ts),
+                            )
+                            target_mem.commit()
             except Exception as _e:
                 if DEBUG_MODE:
                     print(f"[WARN] In-memory DB insert failed: {_e}")
@@ -618,7 +763,7 @@ def fts_search_messages(
 
     def run_query(match_query):
         sql = """
-            SELECT m.role, m.content, m.created_at, m.session_id, bm25(messages_fts) AS score
+            SELECT m.id, m.role, m.content, m.created_at, m.session_id, bm25(messages_fts) AS score
             FROM messages_fts
             JOIN messages m ON m.id = messages_fts.rowid
             WHERE messages_fts MATCH ?
@@ -650,11 +795,12 @@ def fts_search_messages(
             rows = run_query(q_or)
 
     return [{
-        "role": r[0],
-        "content": r[1],
-        "created_at": r[2],
-        "session_id": r[3],
-        "score": float(r[4]) if r[4] is not None else None
+        "id": r[0],
+        "role": r[1],
+        "content": r[2],
+        "created_at": r[3],
+        "session_id": r[4],
+        "score": float(r[5]) if r[5] is not None else None
     } for r in rows]
 
 
@@ -682,6 +828,76 @@ def _dedupe_rows(rows: list[dict]) -> list[dict]:
         if score is not None and score < existing_score:
             merged[key] = r
     return list(merged.values())
+
+
+def _dedupe_corpus_rows(rows: list[dict]) -> list[dict]:
+    merged = {}
+    for r in rows:
+        key = (r.get("source"), r.get("created_at"), r.get("content"))
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = r
+            continue
+        score = r.get("score")
+        existing_score = existing.get("score")
+        if existing_score is None:
+            if score is not None:
+                merged[key] = r
+            continue
+        if score is not None and score < existing_score:
+            merged[key] = r
+    return list(merged.values())
+
+
+def fts_search_corpus(
+    query_text: str,
+    limit: int = FTS_MAX_HITS,
+    cutoff_ts: float | None = None,
+    conn: sqlite3.Connection | None = None,
+    lock=None,
+    allow_or_fallback: bool = True,
+):
+    q = _fts_sanitize_query(query_text, " ")
+    if not q:
+        return []
+
+    def run_query(match_query):
+        sql = """
+            SELECT d.content, d.created_at, d.id, d.source, bm25(documents_fts) AS score
+            FROM documents_fts
+            JOIN documents d ON d.id = documents_fts.rowid
+            WHERE documents_fts MATCH ?
+        """
+        params = [match_query]
+        if cutoff_ts is not None:
+            sql += " AND d.created_at >= ?"
+            params.append(float(cutoff_ts))
+        sql += " ORDER BY score ASC LIMIT ?"
+        params.append(int(max(1, min(limit, 50))))
+
+        try:
+            target_conn = conn or corpus_conn
+            if target_conn is None:
+                return []
+            target_lock = lock or db_lock
+            with target_lock:
+                return target_conn.execute(sql, tuple(params)).fetchall()
+        except Exception:
+            return []
+
+    rows = run_query(q)
+    if allow_or_fallback and not rows:
+        q_or = _fts_sanitize_query(query_text, " OR ")
+        if q_or and q_or != q:
+            rows = run_query(q_or)
+
+    return [{
+        "content": r[0],
+        "created_at": r[1],
+        "doc_id": r[2],
+        "source": r[3],
+        "score": float(r[4]) if r[4] is not None else None,
+    } for r in rows]
 
 
 def fts_recursive_search(
@@ -797,13 +1013,130 @@ def fts_recursive_search(
     return final_rows
 
 
+def fts_recursive_search_corpus(
+    query_text: str,
+    limit: int = FTS_MAX_HITS,
+    cutoff_ts: float | None = None,
+    conn: sqlite3.Connection | None = None,
+    lock=None,
+    depth: int = FTS_RECURSIVE_DEPTH,
+    max_queries: int = FTS_RECURSIVE_MAX_QUERIES,
+    max_branches: int = FTS_RECURSIVE_MAX_BRANCHES,
+    oversample: int = FTS_RECURSIVE_OVERSAMPLE,
+    min_match_tokens: int = FTS_RECURSIVE_MIN_MATCH,
+    debug: dict | None = None,
+):
+    root_tokens = _fts_tokenize(query_text)
+    strong_tokens = _filter_stop_tokens(root_tokens) or root_tokens
+    if not strong_tokens:
+        return []
+    target_conn = conn or corpus_conn
+    target_lock = lock or db_lock
+    if target_conn is None:
+        return []
+
+    query_state = {"count": 0}
+    max_queries = max(1, int(max_queries))
+    oversample = max(1, int(oversample))
+
+    if debug is not None:
+        debug.setdefault("queries", [])
+        debug.setdefault("subqueries", [])
+        debug["root_tokens"] = root_tokens
+        debug["strong_tokens"] = strong_tokens
+        debug["depth"] = int(depth)
+        debug["max_queries"] = int(max_queries)
+        debug["max_branches"] = int(max_branches)
+        debug["oversample"] = int(oversample)
+        debug["min_match_tokens"] = int(min_match_tokens)
+
+    def run_query(q, allow_or):
+        if query_state["count"] >= max_queries:
+            return []
+        query_state["count"] += 1
+        results = fts_search_corpus(
+            q,
+            limit=limit * oversample,
+            cutoff_ts=cutoff_ts,
+            conn=target_conn,
+            lock=target_lock,
+            allow_or_fallback=allow_or,
+        )
+        if debug is not None:
+            debug["queries"].append({
+                "query": q,
+                "allow_or": bool(allow_or),
+                "results": len(results),
+            })
+        return results
+
+    def search_recursive(q, depth_left):
+        rows = run_query(q, allow_or=False)
+        if rows:
+            return rows
+        if depth_left <= 0:
+            return run_query(q, allow_or=True)
+        sub_tokens = _filter_stop_tokens(_fts_tokenize(q))
+        subqueries = _build_subqueries(sub_tokens or strong_tokens, max_branches)
+        if debug is not None:
+            debug["subqueries"].append({
+                "depth_left": int(depth_left),
+                "query": q,
+                "subqueries": subqueries,
+            })
+        acc = []
+        for sub in subqueries:
+            if query_state["count"] >= max_queries:
+                break
+            acc.extend(search_recursive(sub, depth_left - 1))
+            if len(acc) >= limit * oversample:
+                break
+        return acc
+
+    rows = search_recursive(query_text, int(depth))
+    if debug is not None:
+        debug["raw_count"] = len(rows)
+    if not rows:
+        if debug is not None:
+            debug["query_count"] = query_state["count"]
+            debug["returned_count"] = 0
+        return []
+
+    deduped = _dedupe_corpus_rows(rows)
+    if debug is not None:
+        debug["deduped_count"] = len(deduped)
+    if len(strong_tokens) >= 1:
+        min_match = min(max(1, int(min_match_tokens)), len(strong_tokens))
+        filtered = [
+            r for r in deduped
+            if _count_token_matches(r.get("content", ""), strong_tokens) >= min_match
+        ]
+        if filtered:
+            deduped = filtered
+    if debug is not None:
+        debug["filtered_count"] = len(deduped)
+
+    deduped.sort(key=lambda r: (r.get("score") is None, r.get("score") or 0))
+    final_rows = deduped[:limit]
+    if debug is not None:
+        debug["query_count"] = query_state["count"]
+        debug["returned_count"] = len(final_rows)
+    return final_rows
+
+
 __all__ = [
     "db_lock",
     "db_conn",
     "mem_conn",
+    "corpus_conn",
+    "mem_active_session_id",
     "init_db",
     "_ensure_fts5",
     "init_mem_db",
+    "init_corpus_db",
+    "reset_mem_db",
+    "seed_mem_db_for_session",
+    "sync_mem_db_for_session",
     "seed_mem_db_from_disk",
     "prune_mem_db",
     "start_mem_threads",
@@ -820,5 +1153,7 @@ __all__ = [
     "_fts_tokenize",
     "_fts_sanitize_query",
     "fts_search_messages",
+    "fts_search_corpus",
     "fts_recursive_search",
+    "fts_recursive_search_corpus",
 ]

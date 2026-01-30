@@ -100,6 +100,7 @@ def server(tmp_path_factory):
     data_dir = tmp_path_factory.mktemp("data")
     models_dir = tmp_path_factory.mktemp("models")
     use_fake_llm = os.environ.get("SIMON_TEST_USE_FAKE_LLM", "0") == "1"
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
     if use_fake_llm:
         os.environ["SIMON_TEST_MODE"] = "1"
     else:
@@ -133,9 +134,12 @@ def clean_state(server):
             server.db_conn.execute("DELETE FROM messages")
             server.db_conn.execute("DELETE FROM sessions")
             server.db_conn.commit()
-            server.mem_conn.execute("DELETE FROM messages")
-            server.mem_conn.execute("DELETE FROM sessions")
-            server.mem_conn.commit()
+            try:
+                server.db.reset_mem_db(conn=server.mem_conn, lock=server.db_lock)
+            except Exception:
+                server.mem_conn.execute("DELETE FROM messages")
+                server.mem_conn.execute("DELETE FROM sessions")
+                server.mem_conn.commit()
     except Exception:
         with server.db_lock:
             try:
@@ -152,6 +156,10 @@ def clean_state(server):
             except Exception:
                 pass
             server.mem_conn = server.init_mem_db()
+            try:
+                server.db.mem_active_session_id = None
+            except Exception:
+                pass
     server.METRICS_HISTORY.clear()
     yield
 

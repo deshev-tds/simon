@@ -3,7 +3,7 @@ import time
 
 import backend.db as db
 import backend.memory as memory_mod
-from backend.config import MAX_TOOL_OUTPUT_CHARS
+from backend.config import MAX_TOOL_OUTPUT_CHARS, RLM_FTS_WEAK_SCORE, RLM_MIN_FTS_HITS
 
 SIMON_TOOLS = [
     {
@@ -63,6 +63,23 @@ def _safe_args(raw_args):
         return {"_raw": str(raw_args)}
 
 
+def _format_ts(ts: float | int | None) -> tuple[str, int]:
+    if ts is None:
+        return "ts=?", 0
+    try:
+        ts_int = int(float(ts) * 1000)
+    except (TypeError, ValueError):
+        ts_int = 0
+    return f"ts={ts_int}", ts_int
+
+
+def _best_bm25(rows: list[dict]) -> float | None:
+    scores = [r.get("score") for r in rows if r.get("score") is not None]
+    if not scores:
+        return None
+    return min(scores)
+
+
 def tool_search_memory(
     query: str,
     scope: str = "recent",
@@ -76,40 +93,141 @@ def tool_search_memory(
     cutoff_ts = time.time() - (60 * 24 * 3600) if scope == "recent" else None
 
     mem = memory or memory_mod.memory
-    conn = mem_conn or db.mem_conn
     lock = db_lock or db.db_lock
 
-    docs, dists, metas = mem.search(query, n_results=3, days_filter=days, session_filter=sess_filter)
-
-    fts_res = []
-    if scope in ["recent", "session"]:
-        target_sess = session_id if scope == "session" else None
+    fts_res: list[dict] = []
+    corpus_res: list[dict] = []
+    target_conn = db.db_conn
+    if scope == "session":
         fts_res = db.fts_recursive_search(
             query,
-            session_id=target_sess,
+            session_id=session_id,
+            limit=3,
+            conn=target_conn,
+            lock=lock,
+        )
+    elif scope == "recent":
+        fts_res = db.fts_recursive_search(
+            query,
+            session_id=None,
             limit=3,
             cutoff_ts=cutoff_ts,
-            conn=conn,
+            conn=target_conn,
+            lock=lock,
+        )
+    else:
+        fts_res = db.fts_recursive_search(
+            query,
+            session_id=None,
+            limit=3,
+            conn=target_conn,
+            lock=lock,
+        )
+        corpus_res = db.fts_recursive_search_corpus(
+            query,
+            limit=3,
+            conn=db.corpus_conn,
             lock=lock,
         )
 
-    results = []
-    for doc, meta in zip(docs, metas):
+    best_score = _best_bm25(fts_res) or _best_bm25(corpus_res)
+    total_text_hits = len(fts_res) + len(corpus_res)
+    fts_is_weak = (
+        total_text_hits < RLM_MIN_FTS_HITS
+        or best_score is None
+        or best_score > RLM_FTS_WEAK_SCORE
+    )
+
+    docs, dists, metas = ([], [], [])
+    if fts_is_weak:
+        docs, dists, metas = mem.search(query, n_results=3, days_filter=days, session_filter=sess_filter)
+
+    evidence_items = []
+
+    for doc, dist, meta in zip(docs, dists, metas):
         sess = meta.get("session_id", "?")
-        ts = meta.get("timestamp", 0)
-        date_str = time.strftime("%Y-%m-%d", time.localtime(ts))
-        results.append(f"[VECTOR] (Sess:{sess}, {date_str}): {doc[:150]}...")
+        ts = meta.get("timestamp", 0) or 0
+        content = doc.replace("\n", " ")
+        evidence_items.append({
+            "source_type": "vector",
+            "doc_id": meta.get("content_hash") or meta.get("id"),
+            "ts": int(float(ts) * 1000) if ts else 0,
+            "text": content[:200],
+            "score": None,
+            "distance": dist,
+            "session_id": sess,
+        })
 
     for item in fts_res:
-        role = item["role"]
-        content = item["content"].replace("\n", " ")
+        role = item.get("role") or "user"
+        content = (item.get("content") or "").replace("\n", " ")
         sess = item.get("session_id", "?")
-        results.append(f"[EXACT] (Sess:{sess}, {role}): {content[:150]}...")
+        created_at = item.get("created_at") or 0
+        evidence_items.append({
+            "source_type": "fts",
+            "doc_id": item.get("id"),
+            "ts": int(float(created_at) * 1000) if created_at else 0,
+            "text": content[:200],
+            "score": item.get("score"),
+            "distance": None,
+            "session_id": sess,
+            "role": role,
+        })
 
-    if not results:
+    for item in corpus_res:
+        content = (item.get("content") or "").replace("\n", " ")
+        source = item.get("source") or "corpus"
+        created_at = item.get("created_at") or 0
+        evidence_items.append({
+            "source_type": "corpus",
+            "doc_id": item.get("doc_id") or item.get("id"),
+            "ts": int(float(created_at) * 1000) if created_at else 0,
+            "text": content[:200],
+            "score": item.get("score"),
+            "distance": None,
+            "source": source,
+        })
+
+    # Deduplicate by text
+    deduped = []
+    seen = set()
+    for item in evidence_items:
+        key = (item.get("text") or "").lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+
+    if not deduped:
         return "No relevant memories found."
 
-    full_resp = "\n".join(results)
+    lines = []
+    for item in deduped:
+        source_type = (item.get("source_type") or "unknown").upper()
+        ts = item.get("ts")
+        ts_label = f"ts={ts}" if ts else "ts=?"
+        text = (item.get("text") or "").strip()
+        if source_type == "VECTOR":
+            sess = item.get("session_id", "?")
+            date_str = time.strftime("%Y-%m-%d", time.localtime((item.get("ts") or 0) / 1000))
+            lines.append(f"[VECTOR] (Sess:{sess}, {date_str}, {ts_label}): {text[:150]}...")
+        elif source_type == "FTS":
+            sess = item.get("session_id", "?")
+            role = item.get("role") or "user"
+            date_str = time.strftime("%Y-%m-%d", time.localtime((item.get("ts") or 0) / 1000))
+            lines.append(f"[EXACT] (Sess:{sess}, {date_str}, {ts_label}, {role}): {text[:150]}...")
+        elif source_type == "CORPUS":
+            source = item.get("source") or "corpus"
+            date_str = time.strftime("%Y-%m-%d", time.localtime((item.get("ts") or 0) / 1000))
+            lines.append(f"[CORPUS] ({source}, {date_str}, {ts_label}): {text[:150]}...")
+        else:
+            lines.append(f"[{source_type}] ({ts_label}): {text[:150]}...")
+
+    payload = {"items": deduped, "lines": lines}
+    payload_str = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    full_resp = f"EVIDENCE_JSON: {payload_str}"
+    if lines:
+        full_resp += "\n" + "\n".join(lines)
     if len(full_resp) > MAX_TOOL_OUTPUT_CHARS:
         return full_resp[:MAX_TOOL_OUTPUT_CHARS] + "...[TRUNCATED]"
     return full_resp

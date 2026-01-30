@@ -1,21 +1,9 @@
-import threading
 import time
 
 
-def _wait_for_condition(fn, timeout_s=5.0, sleep_s=0.05):
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        if fn():
-            return True
-        time.sleep(sleep_s)
-    return False
-
-
-def test_memdb_seed_and_prune_threads(server):
-    server.MEM_SEED_LIMIT = 30
-    server.MEM_MAX_ROWS = 10
-    server.MEM_PRUNE_INTERVAL_S = 1
-
+def test_memdb_hot_session_sync(server):
+    original_limit = server.db.MEM_HOT_SESSION_LIMIT
+    server.db.MEM_HOT_SESSION_LIMIT = 10
     session_id = server.create_session("seed", None, None, None)
     base_ts = time.time() - 3600
     with server.db_lock:
@@ -30,37 +18,35 @@ def test_memdb_seed_and_prune_threads(server):
         mem_count = server.mem_conn.execute("SELECT COUNT(1) FROM messages").fetchone()[0]
     assert mem_count == 0
 
-    stop_event = threading.Event()
-    threads = server.db.start_mem_threads(
-        db_conn=server.db_conn,
-        mem_conn=server.mem_conn,
-        mem_seed_limit=server.MEM_SEED_LIMIT,
-        mem_max_rows=server.MEM_MAX_ROWS,
-        mem_prune_interval_s=server.MEM_PRUNE_INTERVAL_S,
-        stop_event=stop_event,
-        db_lock=server.db_lock,
-    )
-    assert threads is not None
+    server.db.sync_mem_db_for_session(session_id, limit=server.db.MEM_HOT_SESSION_LIMIT, lock=server.db_lock)
 
-    def mem_count_now():
-        with server.db_lock:
-            return server.mem_conn.execute("SELECT COUNT(1) FROM messages").fetchone()[0]
+    with server.db_lock:
+        mem_count = server.mem_conn.execute(
+            "SELECT COUNT(1) FROM messages WHERE session_id=?",
+            (session_id,),
+        ).fetchone()[0]
+    assert mem_count == 10
+    assert server.db.mem_active_session_id == session_id
 
-    assert _wait_for_condition(lambda: mem_count_now() >= 10)
+    with server.db_lock:
+        row = server.mem_conn.execute(
+            "SELECT 1 FROM messages WHERE session_id=? AND content LIKE ?",
+            (session_id, "%TOKEN0030%")
+        ).fetchone()
+    assert row is not None
+    with server.db_lock:
+        row = server.mem_conn.execute(
+            "SELECT 1 FROM messages WHERE session_id=? AND content LIKE ?",
+            (session_id, "%TOKEN0001%")
+        ).fetchone()
+    assert row is None
 
-    keep_start = 30 - server.MEM_MAX_ROWS + 1
-    keep_token = f"TOKEN{keep_start + 4:04d}"
-    hits = server.fts_search_messages(
-        keep_token,
-        session_id=session_id,
-        conn=server.mem_conn,
-        lock=server.db_lock,
-    )
-    assert hits
-
-    assert _wait_for_condition(lambda: mem_count_now() <= 10, timeout_s=8.0)
-
-    stop_event.set()
-    for t in threads:
-        t.join(timeout=1)
-    server._mem_threads_started = False
+    other_session = server.create_session("other", None, None, None)
+    server.save_interaction(other_session, "hello", "ok")
+    with server.db_lock:
+        other_rows = server.mem_conn.execute(
+            "SELECT COUNT(1) FROM messages WHERE session_id=?",
+            (other_session,),
+        ).fetchone()[0]
+    assert other_rows == 0
+    server.db.MEM_HOT_SESSION_LIMIT = original_limit

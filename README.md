@@ -60,6 +60,16 @@ To solve this, I implemented a **Dual-Index Memory**:
 
 **Why this matters:** The Recursive Agent can now use the `search_memory` tool to perform precise lookups. If the user asks, "What was the error code?", the vector search might fail, but the FTS5 layer will catch "Error 500" via token matching. This is the difference between a "chatty" assistant and a "competent" one.
 
+#### Tiered Storage (Hot / Warm / Cold)
+
+Simon treats memory as tiers rather than a single in-RAM pool:
+
+* **Hot (memdb / RAM):** Only the *current* session, capped to the last N messages (`SIMON_MEM_HOT_SESSION_LIMIT`). This keeps the hot path fast and bounded.
+* **Warm (history.db / disk):** Full session history across all chats (SQLite + FTS5). **Primary** source for deep recall outside the prompt window.
+* **Cold (corpus.db / disk):** Large documents/knowledge base stored separately with FTS5. Queried only via tools; never loaded into RAM wholesale.
+
+**Implication:** `search_memory(scope="global")` queries disk FTS over **both** Warm (chat history) and Cold (corpus) tiers. Memdb is *not* a deep-history cache.
+
 #### Archive Memory (ChatGPT history)
 
 Simon can ingest a ChatGPT export into a separate vector collection (`chatgpt_archive`) and the SQL session store.
@@ -114,6 +124,7 @@ Simon uses an explicit gate to decide when to pay the latency cost of deep/recur
 - **Recall / complexity intent:** keywords like "remember", "compare", "timeline", "сравни".
 - **Retrieval confidence:** weak vector match and/or zero FTS hits.
 - **Recent window short-circuit:** if the query overlaps heavily with the last N turns, skip deep mode.
+- **Evidence-bound answers:** in deep mode, final answers must be grounded in tool evidence; if no evidence exists, the system replies `not found`. When the query asks for a single value (code/date/amount/email/phone/name/city/formula), the system extracts that value deterministically from evidence lines.
 
 **Rule of thumb:**
 - Explicit intent → deep mode.
@@ -129,6 +140,8 @@ Simon uses an explicit gate to decide when to pay the latency cost of deep/recur
 - `SIMON_RLM_MIN_QUERY_LEN` (default `20`)
 - `SIMON_RLM_VECTOR_WEAK_DIST` (default `0.55`)
 - `SIMON_RLM_MIN_FTS_HITS` (default `1`)
+- `SIMON_RLM_MAX_HOPS` (default `3`)
+- `SIMON_RLM_DEEP_HISTORY_MAX_MSGS` (default `2`) and `SIMON_RLM_DEEP_HISTORY_MAX_CHARS` (default `600`) to keep Deep Mode context surgical (avoid filler pollution).
 
 ### D. Context Budgeting & Token Management
 
@@ -174,13 +187,14 @@ The TTS endpoint (`speech_endpoint`) attempts MP3 conversion first. If it throws
 * **Inference:** `faster_whisper` (Int8 Quantization), Local LLM (via LM Studio/OpenAI API standards), `Kokoro-ONNX` (Real-time TTS).
 * **Backend:** FastAPI, Python 3.10+, AsyncIO.
 * **Data:** ChromaDB (Vector), SQLite (Relational + FTS5).
+* **Corpus:** Separate SQLite FTS DB (`corpus.db`) for long-form documents.
 * **Protocol:** WebSockets for real-time bi-directional audio streaming.
 
 ---
 
 ## 6. Testing (Unit + Integration)
 
-Unit tests exercise the API, WebSocket flows, memdb seed/prune, and FTS retrieval. Integration tests run against a live LM Studio server (no LLM mocks) and verify that a "needle" token can be recalled via memdb/FTS and confirmed by the model response. If LM Studio has only one model loaded, you can leave `SIMON_DEFAULT_LLM_MODEL` empty to let it pick the default.
+Unit tests exercise the API, WebSocket flows, **hot-session memdb sync**, and FTS retrieval. Integration tests run against a live LM Studio server (no LLM mocks) and verify that a "needle" token can be recalled via disk FTS and confirmed by the model response. If LM Studio has only one model loaded, you can leave `SIMON_DEFAULT_LLM_MODEL` empty to let it pick the default.
 
 **Methodology / Principles:**
 * **Fast by default:** Unit tests skip vector memory and audio model loads to keep the feedback loop tight.
@@ -198,12 +212,17 @@ Unit tests are optimized for fast, deterministic feedback on core logic (API, FT
 * `SIMON_SKIP_AUDIO_MODELS=1` to avoid loading TTS/STT in unit tests.
 * `SIMON_EMBEDDINGS_REMOTE_ALLOWED=1` if vector memory needs remote embedding model downloads.
 * `SIMON_DEFAULT_LLM_MODEL=""` to let LM Studio choose the only loaded model.
-* `SIMON_MEM_SEED_LIMIT`, `SIMON_MEM_MAX_ROWS`, `SIMON_MEM_PRUNE_INTERVAL_S` to control memdb seed/prune behavior.
+* `SIMON_MEM_HOT_SESSION_LIMIT` to cap the in-RAM hot window per session.
+* `SIMON_MEM_SEED_LIMIT`, `SIMON_MEM_MAX_ROWS`, `SIMON_MEM_PRUNE_INTERVAL_S` (legacy) if you intentionally enable background memdb seed/prune threads.
 
 **Run the suites:**
 * `tests/run_tests.sh` (unit)
 * `tests/run_tests.sh --integration` (integration, requires LM Studio at `http://localhost:1234/v1`)
 * `tests/run_tests.sh --all`
+
+**Demo (large corpus bridge):**
+* `python scripts/demo_rlm_bridge.py --fresh --tokens-per-stage 500000 --probe`
+* By default the demo uses the *plain* query (no prefixes/suffixes). To force Deep Mode during a demo run, add `--force-gate`.
 
 **Needle recall integration test (excerpt):**
 
