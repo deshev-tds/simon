@@ -16,6 +16,7 @@ BACKEND_PORT=8000
 BACKEND_HTTP_PORT=8001
 FRONTEND_PORT=3000
 FRONTEND_SCHEME="http"
+KEEP_PERMANENT_LOGS="${SIMON_KEEP_PERMANENT_LOGS:-0}"
 TLS_AVAILABLE=0
 if [[ -f "$ROOT_DIR/certs/key.pem" && -f "$ROOT_DIR/certs/cert.pem" ]]; then
   FRONTEND_SCHEME="https"
@@ -42,6 +43,12 @@ is_running() {
   fi
   rm -f "$pidfile"
   return 1
+}
+
+prepare_logs() {
+  if [[ "$KEEP_PERMANENT_LOGS" -ne 1 ]]; then
+    rm -f "$BACKEND_LOG" "$BACKEND_HTTP_LOG" "$FRONTEND_LOG"
+  fi
 }
 
 print_status() {
@@ -96,19 +103,36 @@ start_backend() {
   fi
   kill_port_processes "$BACKEND_PORT"
   kill_port_processes "$BACKEND_HTTP_PORT"
+  prepare_logs
 
   if [[ "$TLS_AVAILABLE" -eq 1 ]]; then
     echo "Starting backend (TLS on ${BACKEND_PORT})..."
-    (cd "$ROOT_DIR" && nohup "$PYTHON_BIN" -m uvicorn backend.server:app --host 0.0.0.0 --port "$BACKEND_PORT" \
-      --ssl-keyfile "$ROOT_DIR/certs/key.pem" --ssl-certfile "$ROOT_DIR/certs/cert.pem" \
-      >"$BACKEND_LOG" 2>&1 & echo $! >"$BACKEND_PID_FILE")
+    if [[ "$KEEP_PERMANENT_LOGS" -eq 1 ]]; then
+      (cd "$ROOT_DIR" && nohup "$PYTHON_BIN" -m uvicorn backend.server:app --host 0.0.0.0 --port "$BACKEND_PORT" \
+        --ssl-keyfile "$ROOT_DIR/certs/key.pem" --ssl-certfile "$ROOT_DIR/certs/cert.pem" \
+        >>"$BACKEND_LOG" 2>&1 & echo $! >"$BACKEND_PID_FILE")
+    else
+      (cd "$ROOT_DIR" && nohup "$PYTHON_BIN" -m uvicorn backend.server:app --host 0.0.0.0 --port "$BACKEND_PORT" \
+        --ssl-keyfile "$ROOT_DIR/certs/key.pem" --ssl-certfile "$ROOT_DIR/certs/cert.pem" \
+        >"$BACKEND_LOG" 2>&1 & echo $! >"$BACKEND_PID_FILE")
+    fi
     echo "Starting backend (HTTP on ${BACKEND_HTTP_PORT})..."
-    (cd "$ROOT_DIR" && nohup "$PYTHON_BIN" -m uvicorn backend.server:app --host 0.0.0.0 --port "$BACKEND_HTTP_PORT" \
-      >"$BACKEND_HTTP_LOG" 2>&1 & echo $! >"$BACKEND_HTTP_PID_FILE")
+    if [[ "$KEEP_PERMANENT_LOGS" -eq 1 ]]; then
+      (cd "$ROOT_DIR" && nohup "$PYTHON_BIN" -m uvicorn backend.server:app --host 0.0.0.0 --port "$BACKEND_HTTP_PORT" \
+        >>"$BACKEND_HTTP_LOG" 2>&1 & echo $! >"$BACKEND_HTTP_PID_FILE")
+    else
+      (cd "$ROOT_DIR" && nohup "$PYTHON_BIN" -m uvicorn backend.server:app --host 0.0.0.0 --port "$BACKEND_HTTP_PORT" \
+        >"$BACKEND_HTTP_LOG" 2>&1 & echo $! >"$BACKEND_HTTP_PID_FILE")
+    fi
   else
     echo "Starting backend (HTTP on ${BACKEND_PORT})..."
-    (cd "$ROOT_DIR" && nohup "$PYTHON_BIN" -m uvicorn backend.server:app --host 0.0.0.0 --port "$BACKEND_PORT" \
-      >"$BACKEND_LOG" 2>&1 & echo $! >"$BACKEND_PID_FILE")
+    if [[ "$KEEP_PERMANENT_LOGS" -eq 1 ]]; then
+      (cd "$ROOT_DIR" && nohup "$PYTHON_BIN" -m uvicorn backend.server:app --host 0.0.0.0 --port "$BACKEND_PORT" \
+        >>"$BACKEND_LOG" 2>&1 & echo $! >"$BACKEND_PID_FILE")
+    else
+      (cd "$ROOT_DIR" && nohup "$PYTHON_BIN" -m uvicorn backend.server:app --host 0.0.0.0 --port "$BACKEND_PORT" \
+        >"$BACKEND_LOG" 2>&1 & echo $! >"$BACKEND_PID_FILE")
+    fi
   fi
 
   sleep 1
@@ -133,7 +157,11 @@ start_frontend() {
   fi
   kill_port_processes "$FRONTEND_PORT"
   echo "Starting frontend on ${FRONTEND_PORT}..."
-  (cd "$FRONTEND_DIR" && nohup npm run dev -- --host --port "$FRONTEND_PORT" --strictPort >"$FRONTEND_LOG" 2>&1 & echo $! >"$FRONTEND_PID_FILE")
+  if [[ "$KEEP_PERMANENT_LOGS" -eq 1 ]]; then
+    (cd "$FRONTEND_DIR" && nohup npm run dev -- --host --port "$FRONTEND_PORT" --strictPort >>"$FRONTEND_LOG" 2>&1 & echo $! >"$FRONTEND_PID_FILE")
+  else
+    (cd "$FRONTEND_DIR" && nohup npm run dev -- --host --port "$FRONTEND_PORT" --strictPort >"$FRONTEND_LOG" 2>&1 & echo $! >"$FRONTEND_PID_FILE")
+  fi
   sleep 1
   if is_running "$FRONTEND_PID_FILE"; then
     echo "Frontend up."
@@ -158,6 +186,8 @@ stop_backend() {
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   fi
+  kill_port_processes "$BACKEND_PORT"
+  kill_port_processes "$BACKEND_HTTP_PORT"
   rm -f "$BACKEND_PID_FILE" "$BACKEND_HTTP_PID_FILE"
 }
 
@@ -169,6 +199,7 @@ stop_frontend() {
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   fi
+  kill_port_processes "$FRONTEND_PORT"
   rm -f "$FRONTEND_PID_FILE"
 }
 

@@ -3,7 +3,13 @@ import time
 
 import backend.db as db
 import backend.memory as memory_mod
-from backend.config import MAX_TOOL_OUTPUT_CHARS, RLM_FTS_WEAK_SCORE, RLM_MIN_FTS_HITS
+from backend.config import (
+    MAX_TOOL_OUTPUT_CHARS,
+    QUIET_LOGS,
+    RLM_FTS_WEAK_SCORE,
+    RLM_MIN_FTS_HITS,
+    RLM_TRACE,
+)
 
 SIMON_TOOLS = [
     {
@@ -141,6 +147,20 @@ def tool_search_memory(
     docs, dists, metas = ([], [], [])
     if fts_is_weak:
         docs, dists, metas = mem.search(query, n_results=3, days_filter=days, session_filter=sess_filter)
+
+    if RLM_TRACE and not QUIET_LOGS:
+        top_dist = min(dists) if dists else None
+        trace = {
+            "query": query,
+            "scope": scope,
+            "fts_hits": len(fts_res),
+            "corpus_hits": len(corpus_res),
+            "best_bm25": best_score,
+            "fts_is_weak": fts_is_weak,
+            "vector_hits": len(docs),
+            "top_dist": top_dist,
+        }
+        print(f"[TRACE][search_memory] {json.dumps(trace, ensure_ascii=False)}")
 
     evidence_items = []
 

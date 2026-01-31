@@ -16,8 +16,10 @@ from backend.config import (
     MAX_RECENT_MESSAGES,
     MAX_TOOL_OUTPUT_CHARS,
     QUIET_LOGS,
+    RLM_TRACE,
     RLM_FALLBACK_ENABLED,
     RLM_MAX_HOPS,
+    RLM_STREAM,
     RLM_DEEP_HISTORY_MAX_MSGS,
     RLM_DEEP_HISTORY_MAX_CHARS,
     SKIP_VECTOR_MEMORY,
@@ -632,6 +634,44 @@ def _print_perf_report(metrics):
     print(f"------------------------------------------\n")
 
 
+def _trace_rlm_metrics(metrics: dict):
+    if not RLM_TRACE or QUIET_LOGS:
+        return
+    gate = metrics.get("rlm_gate")
+    if gate:
+        print(f"[TRACE][rlm_gate] {json.dumps(gate, ensure_ascii=False)}")
+    evidence = metrics.get("evidence") or {}
+    if evidence:
+        items = evidence.get("items") or []
+        counts = {}
+        for item in items:
+            src = (item.get("source_type") or "unknown").lower()
+            counts[src] = counts.get(src, 0) + 1
+        trace = {
+            "ok": evidence.get("ok"),
+            "reason": evidence.get("reason"),
+            "matches": evidence.get("matches"),
+            "enforced": evidence.get("enforced"),
+            "counts": counts,
+            "sample": [i.get("text") for i in items[:3]],
+        }
+        print(f"[TRACE][evidence] {json.dumps(trace, ensure_ascii=False)}")
+    fallback = metrics.get("rlm_fallback")
+    if fallback:
+        print(f"[TRACE][rlm_fallback] {json.dumps(fallback, ensure_ascii=False)}")
+
+
+def _trace_final_answer(text: str | None):
+    if not RLM_TRACE or QUIET_LOGS:
+        return
+    if not text:
+        return
+    preview = text.replace("\n", " ").strip()
+    if len(preview) > 240:
+        preview = preview[:240] + "…"
+    print(f"[TRACE][final_answer] {preview}")
+
+
 def _format_memory_context(history, max_messages=6, max_chars=2000):
     if not history:
         return ""
@@ -1081,12 +1121,15 @@ async def process_and_stream_response(
             threading.Thread(target=db.save_interaction, args=(session_id, user_text, full_reply)).start()
 
             metrics["end_time"] = time.time()
+            _trace_rlm_metrics(metrics)
+            _trace_final_answer(full_reply)
             _print_perf_report(metrics)
             finalize_metrics(metrics, "ok")
             await websocket.send_text(f"LOG:AI: {full_reply}")
             await websocket.send_text("DONE")
         else:
             metrics["end_time"] = time.time()
+            _trace_rlm_metrics(metrics)
             finalize_metrics(metrics, "empty_reply")
             await websocket.send_text("DONE")
         return
@@ -1344,64 +1387,83 @@ async def process_and_stream_response(
 
                     if not is_deep_mode or evidence_ok:
                         stream_start = time.time()
-                        stream = client.chat.completions.create(
-                            model=model_name,
-                            messages=final_messages,
-                            temperature=0.2 if is_deep_mode else 0.7,
-                            stream=True
-                        )
+                        use_stream = not (is_deep_mode and not RLM_STREAM)
+                        if use_stream:
+                            stream = client.chat.completions.create(
+                                model=model_name,
+                                messages=final_messages,
+                                temperature=0.2 if is_deep_mode else 0.7,
+                                stream=True
+                            )
 
-                        delta_buffer = ""
-                        last_flush = time.monotonic()
-                        current_sentence = ""
-                        for chunk in stream:
-                            if stop_evt.is_set():
-                                break
+                            delta_buffer = ""
+                            last_flush = time.monotonic()
+                            current_sentence = ""
+                            for chunk in stream:
+                                if stop_evt.is_set():
+                                    break
 
-                            choices = getattr(chunk, "choices", None)
-                            if choices is None and isinstance(chunk, dict):
-                                choices = chunk.get("choices")
-                            if not choices:
-                                continue
-                            choice0 = choices[0]
-                            delta = getattr(choice0, "delta", None)
-                            if delta is None and isinstance(choice0, dict):
-                                delta = choice0.get("delta")
-                            if not delta:
-                                continue
-                            token = getattr(delta, "content", None)
-                            if token is None and isinstance(delta, dict):
-                                token = delta.get("content")
-                            if not token:
-                                continue
-                            if metrics.get("ttft") is None:
-                                metrics["ttft"] = time.time() - stream_start
+                                choices = getattr(chunk, "choices", None)
+                                if choices is None and isinstance(chunk, dict):
+                                    choices = chunk.get("choices")
+                                if not choices:
+                                    continue
+                                choice0 = choices[0]
+                                delta = getattr(choice0, "delta", None)
+                                if delta is None and isinstance(choice0, dict):
+                                    delta = choice0.get("delta")
+                                if not delta:
+                                    continue
+                                token = getattr(delta, "content", None)
+                                if token is None and isinstance(delta, dict):
+                                    token = delta.get("content")
+                                if not token:
+                                    continue
+                                if metrics.get("ttft") is None:
+                                    metrics["ttft"] = time.time() - stream_start
 
-                            final_text_buffer += token
-                            if emit_text_deltas:
-                                delta_buffer += token
-                                now = time.monotonic()
-                                if len(delta_buffer) >= STREAM_FLUSH_CHARS or (now - last_flush) >= STREAM_FLUSH_SECS:
-                                    send_delta(delta_buffer)
-                                    delta_buffer = ""
-                                    last_flush = now
-                            if generate_audio:
-                                current_sentence += token
+                                final_text_buffer += token
+                                if emit_text_deltas:
+                                    delta_buffer += token
+                                    now = time.monotonic()
+                                    if len(delta_buffer) >= STREAM_FLUSH_CHARS or (now - last_flush) >= STREAM_FLUSH_SECS:
+                                        send_delta(delta_buffer)
+                                        delta_buffer = ""
+                                        last_flush = now
+                                if generate_audio:
+                                    current_sentence += token
 
-                            if generate_audio and sentence_endings.search(current_sentence[-2:]) and len(current_sentence.strip()) > 5:
+                                if generate_audio and sentence_endings.search(current_sentence[-2:]) and len(current_sentence.strip()) > 5:
+                                    raw_t = current_sentence.strip()
+                                    clean_t = re.sub(r"[*#_`~]+", "", raw_t).strip()
+                                    if clean_t:
+                                        enqueue_text(clean_t)
+                                    current_sentence = ""
+
+                            if emit_text_deltas and delta_buffer and not stop_evt.is_set():
+                                send_delta(delta_buffer)
+                            if generate_audio and current_sentence.strip() and not stop_evt.is_set():
                                 raw_t = current_sentence.strip()
                                 clean_t = re.sub(r"[*#_`~]+", "", raw_t).strip()
                                 if clean_t:
                                     enqueue_text(clean_t)
-                                current_sentence = ""
-
-                        if emit_text_deltas and delta_buffer and not stop_evt.is_set():
-                            send_delta(delta_buffer)
-                        if generate_audio and current_sentence.strip() and not stop_evt.is_set():
-                            raw_t = current_sentence.strip()
-                            clean_t = re.sub(r"[*#_`~]+", "", raw_t).strip()
-                            if clean_t:
-                                enqueue_text(clean_t)
+                        else:
+                            resp = client.chat.completions.create(
+                                model=model_name,
+                                messages=final_messages,
+                                temperature=0.2 if is_deep_mode else 0.7,
+                                stream=False
+                            )
+                            msg = _msg_to_dict(resp.choices[0].message)
+                            final_text_buffer = msg.get("content") or _extract_message_text(resp.choices[0].message) or ""
+                            if metrics.get("ttft") is None:
+                                metrics["ttft"] = time.time() - stream_start
+                            if emit_text_deltas and final_text_buffer:
+                                send_delta(final_text_buffer)
+                            if generate_audio and final_text_buffer:
+                                clean_t = re.sub(r"[*#_`~]+", "", final_text_buffer).strip()
+                                if clean_t:
+                                    enqueue_text(clean_t)
 
                 except Exception as e:
                     print(f"Streaming Error: {e}")
@@ -1463,6 +1525,8 @@ async def process_and_stream_response(
             threading.Thread(target=db.save_interaction, args=(session_id, user_text, full_reply)).start()
 
             metrics["end_time"] = time.time()
+            _trace_rlm_metrics(metrics)
+            _trace_final_answer(full_reply)
             _print_perf_report(metrics)
             finalize_metrics(metrics, "ok")
             if emit_final_text:
@@ -1470,10 +1534,12 @@ async def process_and_stream_response(
             await websocket.send_text("DONE")
         else:
             metrics["end_time"] = time.time()
+            _trace_rlm_metrics(metrics)
             finalize_metrics(metrics, "empty_reply")
             await websocket.send_text("DONE")
     else:
         metrics["end_time"] = time.time()
+        _trace_rlm_metrics(metrics)
         finalize_metrics(metrics, "aborted")
         await websocket.send_text("LOG: --- ABORTED ---")
 

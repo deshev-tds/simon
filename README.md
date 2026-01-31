@@ -115,16 +115,21 @@ The refactor introduces a bifurcated pipeline:
 **Code Highlight:**
 The loop logic explicitly separates "thinking tokens" from "speaking tokens." The user sees "SYS:THINKING" updates on the frontend while the backend is aggressively querying the database, effectively giving the user a window into the machine's "internal monologue" without cluttering the audio stream.
 
-### C. RLM-lite Gate (Context Debt + Retrieval Confidence)
+### C. RLM-lite Gate + Evidence Discipline (Context Debt + Retrieval Confidence)
 
 Simon uses an explicit gate to decide when to pay the latency cost of deep/recursive reasoning. The goal is to **avoid** expensive recursion on trivial queries, but **escalate** when the relevant facts likely live outside the current prompt window.
 
 **Signals:**
 - **Context debt:** estimated session tokens ÷ window tokens.
 - **Recall / complexity intent:** keywords like "remember", "compare", "timeline", "сравни".
-- **Retrieval confidence:** weak vector match and/or zero FTS hits.
+- **Retrieval confidence:** weak FTS (bm25) and/or zero hits; vector is used only as a fallback when FTS is empty/weak.
 - **Recent window short-circuit:** if the query overlaps heavily with the last N turns, skip deep mode.
 - **Evidence-bound answers:** in deep mode, final answers must be grounded in tool evidence; if no evidence exists, the system replies `not found`. When the query asks for a single value (code/date/amount/email/phone/name/city/formula), the system extracts that value deterministically from evidence lines.
+
+**Evidence layer (unified):**
+- Tool output is normalized into a single schema for FTS + vector + corpus hits: `source_type`, `doc_id`, `ts`, `text`, `score/dist`, `entity_hits`.
+- The extractor/validator runs once over this shared schema (no special-case branches).
+- **Conflict policy:** when multiple matches exist, extraction prefers the most recent evidence by timestamp (recency wins).
 
 **Rule of thumb:**
 - Explicit intent → deep mode.
@@ -140,8 +145,11 @@ Simon uses an explicit gate to decide when to pay the latency cost of deep/recur
 - `SIMON_RLM_MIN_QUERY_LEN` (default `20`)
 - `SIMON_RLM_VECTOR_WEAK_DIST` (default `0.55`)
 - `SIMON_RLM_MIN_FTS_HITS` (default `1`)
+- `SIMON_RLM_FTS_WEAK_SCORE` (default `-1.0`)
 - `SIMON_RLM_MAX_HOPS` (default `3`)
 - `SIMON_RLM_DEEP_HISTORY_MAX_MSGS` (default `2`) and `SIMON_RLM_DEEP_HISTORY_MAX_CHARS` (default `600`) to keep Deep Mode context surgical (avoid filler pollution).
+- `SIMON_RLM_STREAM` (default `1`) to stream Deep Mode final answers; set `0` for non-stream (debug-friendly) completions.
+- `SIMON_RLM_TRACE` (default `0`) to emit `[TRACE]` logs for gate, search, evidence, and fallbacks.
 
 ### D. Context Budgeting & Token Management
 
@@ -153,6 +161,9 @@ Recursive models suffer from "Context Explosion." If an agent queries a document
 `if len(full_resp) > MAX_TOOL_OUTPUT_CHARS: return full_resp[:MAX_TOOL_OUTPUT_CHARS] + "...[TRUNCATED]"`
 
 This forces the agent to be efficient. If it needs more info, it must refine its search query (recursion) rather than dumping the whole database into RAM.
+
+**Default prompt window (tunable):**
+- `ANCHOR_MESSAGES=2`, `MAX_RECENT_MESSAGES=2` (current experiment to keep KV pressure low; increase as needed).
 
 ---
 
@@ -214,6 +225,13 @@ Unit tests are optimized for fast, deterministic feedback on core logic (API, FT
 * `SIMON_DEFAULT_LLM_MODEL=""` to let LM Studio choose the only loaded model.
 * `SIMON_MEM_HOT_SESSION_LIMIT` to cap the in-RAM hot window per session.
 * `SIMON_MEM_SEED_LIMIT`, `SIMON_MEM_MAX_ROWS`, `SIMON_MEM_PRUNE_INTERVAL_S` (legacy) if you intentionally enable background memdb seed/prune threads.
+* `TOKENIZERS_PARALLELISM=false` is set in tests to avoid fork warnings.
+* `SIMON_KEEP_PERMANENT_LOGS=1` to keep logs across restarts (default `0` clears logs on the next `stack.sh` start).
+
+**Runtime logging (stack.sh):**
+- Logs live in `.simon-run/` (`backend.log`, `backend_http.log`, `frontend.log`).
+- Default behavior: logs are **cleared on next start** (session-only logs).
+- Set `SIMON_KEEP_PERMANENT_LOGS=1` to append and keep history across restarts.
 
 **Run the suites:**
 * `tests/run_tests.sh` (unit)
@@ -222,7 +240,9 @@ Unit tests are optimized for fast, deterministic feedback on core logic (API, FT
 
 **Demo (large corpus bridge):**
 * `python scripts/demo_rlm_bridge.py --fresh --tokens-per-stage 500000 --probe`
-* By default the demo uses the *plain* query (no prefixes/suffixes). To force Deep Mode during a demo run, add `--force-gate`.
+* Options: `--force-gate` (force deep mode), `--seed-vectors` (seed vector DB with facts only), `--no-cleanup` (keep /tmp data).
+* The demo prints **retrieval timing** for the live query and shows evidence lines used for extraction.
+* Use `scripts/gen_noise_sentences.py` to generate realistic EN/BG filler text for UI testing.
 
 **Needle recall integration test (excerpt):**
 

@@ -288,6 +288,25 @@ async def _ws_roundtrip(ws, text: str, timeout_s: float = 120.0):
     return messages
 
 
+async def _ws_roundtrip_timed(ws, text: str, timeout_s: float = 120.0):
+    await ws.send(text)
+    messages = []
+    start = time.time()
+    first_token_ts = None
+    while time.time() - start < timeout_s:
+        msg = await ws.recv()
+        if isinstance(msg, bytes):
+            continue
+        messages.append(msg)
+        if first_token_ts is None and isinstance(msg, str) and msg.startswith("LOG:AI:"):
+            first_token_ts = time.time()
+        if msg == "DONE":
+            break
+    elapsed = time.time() - start
+    ttft = (first_token_ts - start) if first_token_ts is not None else None
+    return messages, elapsed, ttft
+
+
 def _metrics_url_from_ws(ws_url: str) -> str:
     if ws_url.startswith("wss://"):
         base = "https://" + ws_url[len("wss://"):]
@@ -642,10 +661,13 @@ def main() -> int:
             if args.force_gate:
                 prefix = f"{args.force_gate_prefix}{prefix}"
             query_msg = f"{prefix}{args.query}{args.query_suffix}"
-            messages = await _ws_roundtrip(ws, query_msg, timeout_s=180.0)
+            messages, elapsed, ttft = await _ws_roundtrip_timed(ws, query_msg, timeout_s=180.0)
             ai = next((m for m in reversed(messages) if isinstance(m, str) and m.startswith("LOG:AI:")), "")
             if ai:
                 print(f"[LIVE] AI: {ai.replace('LOG:AI:', '').strip()}")
+            print(f"[LIVE] Processing time: {elapsed:.2f}s")
+            if ttft is not None:
+                print(f"[LIVE] TTFT: {ttft:.2f}s")
             metrics = _fetch_latest_metrics(args.ws_url)
             if metrics:
                 print(f"[LIVE] Metrics: input_tokens={metrics.get('input_tokens')} output_tokens={metrics.get('output_tokens')}")
