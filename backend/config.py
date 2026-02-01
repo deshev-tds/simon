@@ -45,7 +45,7 @@ DB_PATH = DATA_DIR / "history.db"
 CORPUS_DB_PATH = DATA_DIR / "corpus.db"
 
 WHISPER_MODEL_NAME = "distil-medium.en"
-TTS_VOICE = "am_fenrir"
+TTS_VOICE = "bm_fable"
 DEFAULT_LLM_MODEL = _get_str_env("SIMON_DEFAULT_LLM_MODEL", "")
 
 MAX_RECENT_MESSAGES = 2
