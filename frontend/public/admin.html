@@ -110,6 +110,9 @@
           <th>Audio B</th>
           <th>Decode</th>
           <th>STT</th>
+          <th>Partial</th>
+          <th>Final</th>
+          <th>RTF</th>
           <th>RAG</th>
           <th>CTX</th>
           <th>TTFT</th>
@@ -187,6 +190,9 @@
             <td>${item.audio_bytes ?? 0}</td>
             <td>${fmt(item.audio_decode)}</td>
             <td>${fmt(item.stt)}</td>
+            <td>${fmt(item.partial_latency)}</td>
+            <td>${fmt(item.final_latency)}</td>
+            <td>${fmt(item.stt_rtf, 2)}</td>
             <td>${fmt(item.rag)}</td>
             <td>${fmt(item.ctx)}</td>
             <td>${fmt(item.ttft)}</td>
@@ -207,6 +213,9 @@
           const voiceItems = okItems.filter((item) => item.mode === 'voice');
           const decodeAvg = avg(voiceItems, 'audio_decode');
           const sttAvg = avg(voiceItems, 'stt');
+          const partialAvg = avg(voiceItems, 'partial_latency');
+          const finalAvg = avg(voiceItems, 'final_latency');
+          const rtfAvg = avg(voiceItems, 'stt_rtf');
           const ttftAvg = avg(okItems, 'ttft');
           const llmAvg = avg(okItems, 'llm_total');
           const ttsAvg = avg(voiceItems, 'tts_total');
@@ -220,6 +229,9 @@
             `Summary: n=${items.length} ok=${okItems.length} ` +
             `avg(decode=${fmt(decodeAvg.value)}s/${decodeAvg.count} ` +
             `stt=${fmt(sttAvg.value)}s/${sttAvg.count} ` +
+            `partial=${fmt(partialAvg.value)}s/${partialAvg.count} ` +
+            `final=${fmt(finalAvg.value)}s/${finalAvg.count} ` +
+            `rtf=${fmt(rtfAvg.value, 2)}/${rtfAvg.count} ` +
             `ttft=${fmt(ttftAvg.value)}s/${ttftAvg.count} ` +
             `llm=${fmt(llmAvg.value)}s/${llmAvg.count} ` +
             `tts=${fmt(ttsAvg.value)}s/${ttsAvg.count} ` +

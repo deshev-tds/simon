@@ -32,6 +32,7 @@ import backend.agent as agent
 import backend.db as db
 import backend.tools as tools
 from backend.metrics import *
+from backend.live_stt import LiveTranscriber
 
 # --- AI IMPORTS ---
 from faster_whisper import WhisperModel
@@ -810,6 +811,38 @@ async def websocket_endpoint(websocket: WebSocket):
     current_task = None
     stop_event = threading.Event()
     audio_buffer = io.BytesIO()
+    recording_started_at = None
+    recording_stopped_at = None
+    first_partial_at = None
+
+    def _mark_first_partial():
+        nonlocal first_partial_at
+        if first_partial_at is None:
+            first_partial_at = time.time()
+
+    def _reset_recording_markers():
+        nonlocal recording_started_at, recording_stopped_at, first_partial_at
+        recording_started_at = None
+        recording_stopped_at = None
+        first_partial_at = None
+
+    live_stt = None
+    if LIVE_STT_ENABLED:
+        async def _send_live(payload: dict):
+            await websocket.send_text(f"LIVE:STT:{json.dumps(payload)}")
+
+        live_stt = LiveTranscriber(
+            stt_model=stt_model,
+            send_event=_send_live,
+            sample_rate=SAMPLE_RATE,
+            window_s=LIVE_STT_WINDOW_S,
+            step_s=LIVE_STT_STEP_S,
+            keep_s=LIVE_STT_KEEP_S,
+            min_window_s=LIVE_STT_MIN_WINDOW_S,
+            overlap_words=LIVE_STT_OVERLAP_WORDS,
+            log_fn=log_console,
+            on_first_partial=_mark_first_partial,
+        )
 
     try:
         while True:
@@ -851,13 +884,22 @@ async def websocket_endpoint(websocket: WebSocket):
                         stop_event.clear()
                         if current_task:
                             current_task.cancel()
+                        recording_stopped_at = time.time()
+                        if live_stt:
+                            live_stt.stop()
                         audio_bytes = audio_buffer.getvalue()
                         audio_buffer = io.BytesIO()
                         metrics = init_metrics("voice", current_session_id)
+                        metrics["record_start"] = recording_started_at
+                        metrics["record_end"] = recording_stopped_at
+                        metrics["first_partial"] = first_partial_at
+                        if recording_started_at and first_partial_at:
+                            metrics["partial_latency"] = first_partial_at - recording_started_at
                         metrics["audio_bytes"] = len(audio_bytes)
                         if not audio_bytes:
                             finalize_metrics(metrics, "empty_audio")
                             await websocket.send_text("DONE")
+                            _reset_recording_markers()
                             continue
 
                         t_decode = time.time()
@@ -866,6 +908,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         if audio_np is None:
                             finalize_metrics(metrics, "decode_failed")
                             await websocket.send_text("DONE")
+                            _reset_recording_markers()
                             continue
 
                         t_stt = time.time()
@@ -884,12 +927,23 @@ async def websocket_endpoint(websocket: WebSocket):
                         segments = await asyncio.to_thread(run_transcribe)
                         user_text = " ".join([s.text for s in segments]).strip()
                         metrics['stt'] = time.time() - t_stt
+                        metrics["final_transcript_ready"] = time.time()
+                        if recording_stopped_at:
+                            metrics["final_latency"] = metrics["final_transcript_ready"] - recording_stopped_at
                         metrics["input_chars"] = len(user_text)
+                        if metrics.get("stt"):
+                            audio_duration = len(audio_np) / float(SAMPLE_RATE)
+                            if audio_duration > 0:
+                                metrics["stt_rtf"] = audio_duration / metrics["stt"]
 
                         if not user_text or user_text in ["You", "you", "Thank you", "MBC", "You."]:
                             finalize_metrics(metrics, "empty_transcript")
                             await websocket.send_text("DONE")
+                            _reset_recording_markers()
                             continue
+
+                        if live_stt:
+                            await live_stt.send_final(user_text)
 
                         await websocket.send_text(f"LOG:User: {user_text}")
                         current_task = asyncio.create_task(
@@ -909,6 +963,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 get_current_model=get_current_model,
                             )
                         )
+                        _reset_recording_markers()
                         continue
 
                     # --- TEXT CHAT HANDLER (SILENT MODE) ---
@@ -944,13 +999,26 @@ async def websocket_endpoint(websocket: WebSocket):
                             stop_event.clear()
                             if current_task:
                                 current_task.cancel()
+                            recording_started_at = time.time()
+                            recording_stopped_at = None
+                            first_partial_at = None
+                            if live_stt:
+                                live_stt.reset()
+                                await live_stt.send_reset()
                         audio_buffer.write(data)
+                        if live_stt:
+                            audio_np = convert_webm_to_numpy(data)
+                            if audio_np is not None:
+                                live_stt.add_audio(audio_np)
 
     except WebSocketDisconnect:
         pass
     except Exception as e:
         if not QUIET_LOGS:
             print(f"Error: {e}")
+    finally:
+        if live_stt:
+            live_stt.stop()
 
 
 if __name__ == "__main__":

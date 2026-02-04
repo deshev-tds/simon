@@ -37,6 +37,12 @@ export interface StoredMessage {
   tokens?: number;
 }
 
+export interface LiveTranscript {
+  stable: string;
+  draft: string;
+  isFinal?: boolean;
+}
+
 export interface SessionWindow {
   session: SessionSummary;
   anchors: StoredMessage[];

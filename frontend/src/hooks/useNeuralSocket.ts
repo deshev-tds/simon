@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { ConnectionStatus, Message, SessionSummary, StoredMessage } from '../types';
+import { ConnectionStatus, LiveTranscript, Message, SessionSummary, StoredMessage } from '../types';
 
 const DEFAULT_WS_PORT = 8000;
 const getSocketUrl = () => {
@@ -34,6 +34,7 @@ export const useNeuralSocket = () => {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [currentSessionId, setCurrentSessionId] = useState<number | null>(null);
   const [isLoadingSession, setIsLoadingSession] = useState(false);
+  const [liveTranscript, setLiveTranscript] = useState<LiveTranscript | null>(null);
   
   const socketRef = useRef<WebSocket | null>(null);
   const apiBaseRef = useRef<string | null>(null);
@@ -240,6 +241,7 @@ export const useNeuralSocket = () => {
     isPlayingRef.current = false;
     setAiIsSpeaking(false);
     setIsProcessing(false); // Reset processing if we start talking again
+    setLiveTranscript(null);
 
     if (audioContextRef.current?.state === 'suspended') {
         audioContextRef.current.resume();
@@ -445,6 +447,28 @@ export const useNeuralSocket = () => {
           const payload = text.slice('LOG:AI:'.length);
           finalizeAiMessage(payload.startsWith(' ') ? payload.slice(1) : payload);
       }
+      else if (text.startsWith('LIVE:STT:')) {
+          try {
+              const payload = JSON.parse(text.slice('LIVE:STT:'.length));
+              if (payload?.event === 'reset') {
+                  setLiveTranscript(null);
+              } else if (payload?.event === 'partial') {
+                  setLiveTranscript({
+                      stable: payload?.stable ?? '',
+                      draft: payload?.draft ?? '',
+                      isFinal: false
+                  });
+              } else if (payload?.event === 'final') {
+                  setLiveTranscript({
+                      stable: payload?.text ?? '',
+                      draft: '',
+                      isFinal: true
+                  });
+              }
+          } catch (err) {
+              console.error('Live STT parse error', err);
+          }
+      }
       else if (text.startsWith('RAG:')) {
           try {
               const data = JSON.parse(text.substring(4));
@@ -489,6 +513,7 @@ export const useNeuralSocket = () => {
     isRecording,
     isProcessing,
     isAwaitingResponse,
+    liveTranscript,
     sessions,
     currentSessionId,
     isLoadingSession,

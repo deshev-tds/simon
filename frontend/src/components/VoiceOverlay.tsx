@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { IconX, IconMic, IconMicOff } from './Icons';
 import Visualizer from './Visualizer';
+import { LiveTranscript } from '../types';
 
 interface VoiceOverlayProps {
   isOpen: boolean;
@@ -10,6 +11,7 @@ interface VoiceOverlayProps {
   aiIsSpeaking: boolean;
   isRecording: boolean;
   isProcessing: boolean;
+  liveTranscript: LiveTranscript | null;
 }
 
 const VoiceOverlay: React.FC<VoiceOverlayProps> = ({ 
@@ -19,7 +21,8 @@ const VoiceOverlay: React.FC<VoiceOverlayProps> = ({
   stopRecording, 
   aiIsSpeaking,
   isRecording,
-  isProcessing
+  isProcessing,
+  liveTranscript
 }) => {
   const [isMuted, setIsMuted] = useState(false);
   const [isVisible, setIsVisible] = useState(false);
@@ -71,6 +74,10 @@ const VoiceOverlay: React.FC<VoiceOverlayProps> = ({
       isPulse = true;
   }
 
+  const stableText = liveTranscript?.stable?.trim() ?? "";
+  const draftText = liveTranscript?.draft?.trim() ?? "";
+  const showTranscript = Boolean(stableText || draftText);
+
   return (
     <div 
       className={`fixed inset-0 z-50 flex flex-col items-center justify-between bg-zinc-950/98 backdrop-blur-3xl transition-opacity duration-500 ease-in-out ${isOpen ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}
@@ -86,6 +93,22 @@ const VoiceOverlay: React.FC<VoiceOverlayProps> = ({
            </span>
         </div>
       </div>
+
+      {showTranscript && (
+        <div className="w-full max-w-3xl px-6 -mt-4">
+          <div className={`rounded-2xl border border-white/10 bg-white/5 backdrop-blur-md px-5 py-4 shadow-lg ${liveTranscript?.isFinal ? 'shadow-accent/20 border-accent/30' : ''}`}>
+            <div className="text-[10px] font-mono uppercase tracking-[0.3em] text-zinc-500 mb-2">
+              {liveTranscript?.isFinal ? 'Final Transcript' : 'Live Transcript'}
+            </div>
+            <div className="text-sm leading-relaxed font-mono text-zinc-200 whitespace-pre-wrap">
+              <span className="text-zinc-200">{stableText}</span>
+              {draftText && (
+                <span className="text-zinc-500 italic">{stableText ? ' ' : ''}{draftText}</span>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Main Interactive Visualizer */}
       <div className="flex-1 flex items-center justify-center w-full">

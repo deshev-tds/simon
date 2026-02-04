@@ -17,6 +17,7 @@ const App: React.FC = () => {
     isRecording,
     isProcessing,
     isAwaitingResponse,
+    liveTranscript,
     sessions,
     currentSessionId,
     isLoadingSession,
@@ -75,6 +76,7 @@ const App: React.FC = () => {
         aiIsSpeaking={aiIsSpeaking}
         isRecording={isRecording}
         isProcessing={isProcessing}
+        liveTranscript={liveTranscript}
       />
     </div>
   );
