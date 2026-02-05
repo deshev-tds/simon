@@ -970,246 +970,6 @@ async def process_and_stream_response(
     if rag_payload:
         await websocket.send_text(f"RAG:{json.dumps(rag_payload)}")
 
-    if not is_deep_mode and RLM_FALLBACK_ENABLED and not generate_audio:
-        model_name = get_current_model()
-        log_console(f"Using model: {model_name} | Deep: {is_deep_mode}", "AI")
-        metrics["_llm_start"] = time.time()
-
-        try:
-            base_resp = await asyncio.to_thread(
-                client.chat.completions.create,
-                model=model_name,
-                messages=current_messages,
-                temperature=0.7,
-                stream=False,
-            )
-            base_msg = _msg_to_dict(base_resp.choices[0].message)
-            base_text = base_msg.get("content") or _extract_message_text(base_resp.choices[0].message)
-        except Exception as exc:
-            base_text = ""
-            if DEBUG_MODE:
-                log_console(f"Base completion failed: {exc}", "ERR")
-
-        fallback_reason = None
-        if _needs_fallback(user_text, base_text, gate_decision.metrics or {}):
-            fallback_reason = "answer_inadequate"
-            await websocket.send_text("SYS:THINKING: Entering Deep Mode...")
-            deep_history = _select_deep_history(history)
-            deep_messages = _with_system_prompt([
-                {"role": "system", "content": _DEEP_SYSTEM_PROMPT},
-                *deep_history,
-                {"role": "user", "content": user_text}
-            ])
-            tool_chars_used = 0
-            turn_count = 0
-            auto_hop_used = False
-            tool_calls_made = False
-            all_tool_texts = []
-            while turn_count < AGENT_MAX_TURNS and not stop_event.is_set():
-                turn_count += 1
-                try:
-                    response = await asyncio.to_thread(
-                        client.chat.completions.create,
-                        model=model_name,
-                        messages=deep_messages,
-                        temperature=0.7,
-                        stream=False,
-                        tools=tools.SIMON_TOOLS,
-                        tool_choice="auto",
-                    )
-                except Exception as exc:
-                    if DEBUG_MODE:
-                        log_console(f"Agent Loop Error: {exc}", "ERR")
-                    break
-
-                msg_dict = _msg_to_dict(response.choices[0].message)
-                tool_calls = msg_dict.get("tool_calls") or []
-                if tool_calls:
-                    tool_calls_made = True
-                    deep_messages.append(msg_dict)
-                    await websocket.send_text("SYS:THINKING: Consulting memory...")
-                    tool_texts = []
-                    for tool_call in tool_calls:
-                        fn = tool_call.get("function") or {}
-                        fn_name = fn.get("name") or tool_call.get("name")
-                        args = tools._safe_args(fn.get("arguments"))
-                        result = "Error: Unknown tool"
-
-                        if fn_name == "search_memory":
-                            query = args.get("query", "")
-                            scope = args.get("scope", "recent")
-                            result = tools.tool_search_memory(
-                                query,
-                                scope,
-                                session_id,
-                                memory=memory,
-                                db_lock=db.db_lock,
-                            )
-                        elif fn_name == "analyze_deep_context":
-                            await websocket.send_text("SYS:THINKING: Deep reading transcript...")
-                            target_session = args.get("session_id")
-                            instruction = args.get("instruction", "")
-                            if target_session is None or not instruction:
-                                result = "Error: analyze_deep_context requires session_id and instruction."
-                            else:
-                                result = tools.tool_analyze_deep(
-                                    client,
-                                    get_current_model,
-                                    target_session,
-                                    instruction,
-                                )
-
-                        result_str = str(result)
-                        remain = MAX_TOOL_OUTPUT_CHARS - tool_chars_used
-                        if remain <= 0:
-                            result_str = "[TOOL_BUDGET_EXCEEDED]"
-                        else:
-                            result_str = result_str[:remain]
-                        tool_chars_used += len(result_str)
-                        tool_texts.append(result_str)
-
-                        tool_call_id = tool_call.get("id") or tool_call.get("tool_call_id")
-                        tool_msg = {"role": "tool", "tool_call_id": tool_call_id, "content": result_str}
-                        deep_messages.append(tool_msg)
-                    all_tool_texts.extend(tool_texts)
-                    if not auto_hop_used and tool_texts:
-                        hop = _maybe_auto_hop(
-                            user_text,
-                            "\n".join(tool_texts),
-                            session_id,
-                            memory,
-                            metrics,
-                        )
-                        if hop:
-                            auto_hop_used = True
-                            await websocket.send_text("SYS:THINKING: Following bridge...")
-                            hop_msg = {
-                                "role": "tool",
-                                "tool_call_id": f"auto-hop-{turn_count}",
-                                "content": str(hop["result"]),
-                            }
-                            deep_messages.append(hop_msg)
-                            all_tool_texts.append(str(hop["result"]))
-                else:
-                    break
-
-            try:
-                if not tool_calls_made:
-                    await websocket.send_text("SYS:THINKING: Consulting memory...")
-                    forced = _force_tool_call(user_text, session_id, memory, metrics)
-                    tool_calls_made = True
-                    forced_text = str(forced)
-                    all_tool_texts.append(forced_text)
-                    deep_messages.append({
-                        "role": "tool",
-                        "tool_call_id": "forced-tool",
-                        "content": forced_text[:MAX_TOOL_OUTPUT_CHARS],
-                    })
-
-                evidence_ok, evidence_reason, evidence_items, evidence_lines, evidence_matches = _evidence_check(user_text, all_tool_texts)
-                evidence_ok, evidence_reason, evidence_items, evidence_lines, evidence_matches, tool_chars_used = _apply_hops(
-                    user_text,
-                    session_id,
-                    memory,
-                    metrics,
-                    deep_messages,
-                    all_tool_texts,
-                    tool_chars_used,
-                    evidence_ok,
-                    evidence_reason,
-                    evidence_items,
-                    evidence_lines,
-                    evidence_matches,
-                )
-                metrics["evidence"] = {
-                    "ok": evidence_ok,
-                    "reason": evidence_reason,
-                    "lines": evidence_lines[:10],
-                    "items": evidence_items[:10],
-                    "matches": evidence_matches,
-                    "tool_calls": tool_calls_made or bool(metrics.get("rlm_hops")),
-                }
-                if not (tool_calls_made or metrics.get("rlm_hops")):
-                    evidence_ok = False
-                    evidence_reason = "no_tool_calls"
-                    metrics["evidence"]["ok"] = False
-                    metrics["evidence"]["reason"] = evidence_reason
-
-                if not evidence_ok:
-                    full_reply = "not found"
-                else:
-                    enforced_value, enforced_reason = _enforce_evidence_answer(user_text, evidence_items)
-                    if enforced_reason:
-                        metrics["evidence"]["enforced"] = enforced_reason
-                        full_reply = enforced_value or "not found"
-                    else:
-                        evidence_block = "\n".join(evidence_lines[:10])
-                        final_messages = deep_messages + [{
-                            "role": "system",
-                            "content": (
-                                "Answer ONLY from the tool evidence above. "
-                                "Cite evidence verbatim in your reasoning if needed. "
-                                "If evidence is missing, reply exactly: not found."
-                            )
-                        }]
-                        if evidence_block:
-                            final_messages.append({
-                                "role": "system",
-                                "content": f"EVIDENCE LINES:\n{evidence_block}",
-                            })
-                        final_resp = await asyncio.to_thread(
-                            client.chat.completions.create,
-                            model=model_name,
-                            messages=final_messages,
-                            temperature=0.2,
-                            stream=False,
-                        )
-                        final_msg = _msg_to_dict(final_resp.choices[0].message)
-                        full_reply = final_msg.get("content") or _extract_message_text(final_resp.choices[0].message)
-            except Exception as exc:
-                full_reply = base_text
-                if DEBUG_MODE:
-                    log_console(f"Deep completion failed: {exc}", "ERR")
-        else:
-            full_reply = base_text
-
-        metrics["rlm_fallback"] = {
-            "trigger": fallback_reason is not None,
-            "reason": fallback_reason or "base_ok",
-        }
-        if isinstance(metrics.get("rlm_gate"), dict):
-            metrics["rlm_gate"]["fallback_reason"] = fallback_reason or "base_ok"
-        metrics["llm_total"] = time.time() - metrics["_llm_start"]
-
-        if full_reply:
-            metrics["output_chars"] = len(full_reply)
-            if metrics.get("output_tokens") is None:
-                metrics["output_tokens"] = estimate_tokens_from_text(full_reply)
-            history.append({"role": "user", "content": user_text})
-            history.append({"role": "assistant", "content": full_reply})
-
-            if memory_intents.detect_memory_save(user_text):
-                history_snapshot = list(history)
-                threading.Thread(
-                    target=_save_explicit_memory,
-                    args=(history_snapshot, session_id, client, get_current_model, memory),
-                ).start()
-            threading.Thread(target=db.save_interaction, args=(session_id, user_text, full_reply)).start()
-
-            metrics["end_time"] = time.time()
-            _trace_rlm_metrics(metrics)
-            _trace_final_answer(full_reply)
-            _print_perf_report(metrics)
-            finalize_metrics(metrics, "ok")
-            await websocket.send_text(f"LOG:AI: {full_reply}")
-            await websocket.send_text("DONE")
-        else:
-            metrics["end_time"] = time.time()
-            _trace_rlm_metrics(metrics)
-            finalize_metrics(metrics, "empty_reply")
-            await websocket.send_text("DONE")
-        return
-
     emit_text_deltas = (not generate_audio) or STREAM_TEXT_WITH_AUDIO
     emit_final_text = True
     emit_tts_text = False
@@ -1217,6 +977,237 @@ async def process_and_stream_response(
     q = asyncio.Queue(maxsize=64) if generate_audio else None
     response_holder = {"text": ""}
     sentence_endings = re.compile(r"[.!?]+")
+
+    def _run_text_fallback(base_text: str, model_name: str, loop, stop_evt) -> tuple[str, str | None]:
+        fallback_reason = None
+        full_reply = base_text
+        if not _needs_fallback(user_text, base_text, gate_decision.metrics or {}):
+            metrics["rlm_fallback"] = {"trigger": False, "reason": "base_ok"}
+            if isinstance(metrics.get("rlm_gate"), dict):
+                metrics["rlm_gate"]["fallback_reason"] = "base_ok"
+            return full_reply, fallback_reason
+
+        fallback_reason = "answer_inadequate"
+        if not stop_evt.is_set():
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    websocket.send_text("SYS:THINKING: Entering Deep Mode..."),
+                    loop,
+                )
+            except Exception:
+                pass
+
+        deep_history = _select_deep_history(history)
+        deep_messages = _with_system_prompt([
+            {"role": "system", "content": _DEEP_SYSTEM_PROMPT},
+            *deep_history,
+            {"role": "user", "content": user_text},
+        ])
+        tool_chars_used = 0
+        turn_count = 0
+        auto_hop_used = False
+        tool_calls_made = False
+        all_tool_texts = []
+        while turn_count < AGENT_MAX_TURNS and not stop_evt.is_set():
+            turn_count += 1
+            try:
+                response = client.chat.completions.create(
+                    model=model_name,
+                    messages=deep_messages,
+                    temperature=0.7,
+                    stream=False,
+                    tools=tools.SIMON_TOOLS,
+                    tool_choice="auto",
+                )
+            except Exception as exc:
+                if DEBUG_MODE:
+                    log_console(f"Agent Loop Error: {exc}", "ERR")
+                break
+
+            msg_dict = _msg_to_dict(response.choices[0].message)
+            tool_calls = msg_dict.get("tool_calls") or []
+            if tool_calls:
+                tool_calls_made = True
+                deep_messages.append(msg_dict)
+                if not stop_evt.is_set():
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            websocket.send_text("SYS:THINKING: Consulting memory..."),
+                            loop,
+                        )
+                    except Exception:
+                        pass
+                tool_texts = []
+                for tool_call in tool_calls:
+                    fn = tool_call.get("function") or {}
+                    fn_name = fn.get("name") or tool_call.get("name")
+                    args = tools._safe_args(fn.get("arguments"))
+                    result = "Error: Unknown tool"
+
+                    if fn_name == "search_memory":
+                        query = args.get("query", "")
+                        scope = args.get("scope", "recent")
+                        result = tools.tool_search_memory(
+                            query,
+                            scope,
+                            session_id,
+                            memory=memory,
+                            db_lock=db.db_lock,
+                        )
+                    elif fn_name == "analyze_deep_context":
+                        if not stop_evt.is_set():
+                            try:
+                                asyncio.run_coroutine_threadsafe(
+                                    websocket.send_text("SYS:THINKING: Deep reading transcript..."),
+                                    loop,
+                                )
+                            except Exception:
+                                pass
+                        target_session = args.get("session_id")
+                        instruction = args.get("instruction", "")
+                        if target_session is None or not instruction:
+                            result = "Error: analyze_deep_context requires session_id and instruction."
+                        else:
+                            result = tools.tool_analyze_deep(
+                                client,
+                                get_current_model,
+                                target_session,
+                                instruction,
+                            )
+
+                    result_str = str(result)
+                    remain = MAX_TOOL_OUTPUT_CHARS - tool_chars_used
+                    if remain <= 0:
+                        result_str = "[TOOL_BUDGET_EXCEEDED]"
+                    else:
+                        result_str = result_str[:remain]
+                    tool_chars_used += len(result_str)
+                    tool_texts.append(result_str)
+
+                    tool_call_id = tool_call.get("id") or tool_call.get("tool_call_id")
+                    tool_msg = {"role": "tool", "tool_call_id": tool_call_id, "content": result_str}
+                    deep_messages.append(tool_msg)
+                all_tool_texts.extend(tool_texts)
+                if not auto_hop_used and tool_texts:
+                    hop = _maybe_auto_hop(
+                        user_text,
+                        "\n".join(tool_texts),
+                        session_id,
+                        memory,
+                        metrics,
+                    )
+                    if hop:
+                        auto_hop_used = True
+                        if not stop_evt.is_set():
+                            try:
+                                asyncio.run_coroutine_threadsafe(
+                                    websocket.send_text("SYS:THINKING: Following bridge..."),
+                                    loop,
+                                )
+                            except Exception:
+                                pass
+                        hop_msg = {
+                            "role": "tool",
+                            "tool_call_id": f"auto-hop-{turn_count}",
+                            "content": str(hop["result"]),
+                        }
+                        deep_messages.append(hop_msg)
+                        all_tool_texts.append(str(hop["result"]))
+            else:
+                break
+
+        try:
+            if not tool_calls_made:
+                if not stop_evt.is_set():
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            websocket.send_text("SYS:THINKING: Consulting memory..."),
+                            loop,
+                        )
+                    except Exception:
+                        pass
+                forced = _force_tool_call(user_text, session_id, memory, metrics)
+                tool_calls_made = True
+                forced_text = str(forced)
+                all_tool_texts.append(forced_text)
+                deep_messages.append({
+                    "role": "tool",
+                    "tool_call_id": "forced-tool",
+                    "content": forced_text[:MAX_TOOL_OUTPUT_CHARS],
+                })
+
+            evidence_ok, evidence_reason, evidence_items, evidence_lines, evidence_matches = _evidence_check(
+                user_text, all_tool_texts
+            )
+            evidence_ok, evidence_reason, evidence_items, evidence_lines, evidence_matches, tool_chars_used = _apply_hops(
+                user_text,
+                session_id,
+                memory,
+                metrics,
+                deep_messages,
+                all_tool_texts,
+                tool_chars_used,
+                evidence_ok,
+                evidence_reason,
+                evidence_items,
+                evidence_lines,
+                evidence_matches,
+            )
+            metrics["evidence"] = {
+                "ok": evidence_ok,
+                "reason": evidence_reason,
+                "lines": evidence_lines[:10],
+                "items": evidence_items[:10],
+                "matches": evidence_matches,
+                "tool_calls": tool_calls_made or bool(metrics.get("rlm_hops")),
+            }
+            if not (tool_calls_made or metrics.get("rlm_hops")):
+                evidence_ok = False
+                metrics["evidence"]["ok"] = False
+                metrics["evidence"]["reason"] = "no_tool_calls"
+
+            if not evidence_ok:
+                full_reply = "not found"
+            else:
+                enforced_value, enforced_reason = _enforce_evidence_answer(user_text, evidence_items)
+                if enforced_reason:
+                    metrics["evidence"]["enforced"] = enforced_reason
+                    full_reply = enforced_value or "not found"
+                else:
+                    evidence_block = "\n".join(evidence_lines[:10])
+                    final_messages = deep_messages + [{
+                        "role": "system",
+                        "content": (
+                            "Answer ONLY from the tool evidence above. "
+                            "Cite evidence verbatim in your reasoning if needed. "
+                            "If evidence is missing, reply exactly: not found."
+                        ),
+                    }]
+                    if evidence_block:
+                        final_messages.append({
+                            "role": "system",
+                            "content": f"EVIDENCE LINES:\n{evidence_block}",
+                        })
+                    final_resp = client.chat.completions.create(
+                        model=model_name,
+                        messages=final_messages,
+                        temperature=0.2,
+                        stream=False,
+                    )
+                    final_msg = _msg_to_dict(final_resp.choices[0].message)
+                    full_reply = final_msg.get("content") or _extract_message_text(final_resp.choices[0].message)
+        except Exception as exc:
+            full_reply = base_text
+            if DEBUG_MODE:
+                log_console(f"Deep completion failed: {exc}", "ERR")
+
+        metrics["rlm_fallback"] = {
+            "trigger": True,
+            "reason": fallback_reason,
+        }
+        if isinstance(metrics.get("rlm_gate"), dict):
+            metrics["rlm_gate"]["fallback_reason"] = fallback_reason
+        return full_reply, fallback_reason
 
     async def tts_consumer():
         first_audio_generated = False
@@ -1595,6 +1586,13 @@ async def process_and_stream_response(
                 except Exception as e:
                     print(f"Streaming Error: {e}")
 
+            if (not is_deep_mode) and RLM_FALLBACK_ENABLED and (not generate_audio) and not stop_evt.is_set():
+                final_text_buffer, _fallback_reason = _run_text_fallback(
+                    final_text_buffer,
+                    model_name,
+                    loop,
+                    stop_evt,
+                )
             response_holder["text"] = final_text_buffer
             if session_id and user_text and final_text_buffer and len(history) == 0:
                 threading.Thread(
