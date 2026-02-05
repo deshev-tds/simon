@@ -92,7 +92,7 @@ def _get_int_env(name: str, default: int) -> int:
 
 MAX_IMAGES_PER_MESSAGE = _get_int_env("SIMON_MAX_IMAGES_PER_MESSAGE", 10)
 MAX_IMAGE_MB = _get_float_env("SIMON_MAX_IMAGE_MB", 8.0)
-MAX_IMAGE_EDGE = _get_int_env("SIMON_MAX_IMAGE_EDGE", 2048)
+MAX_IMAGE_EDGE = _get_int_env("SIMON_MAX_IMAGE_EDGE", 1024)
 IMAGE_DIR = DATA_DIR / "images"
 IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 

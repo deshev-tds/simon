@@ -36,7 +36,7 @@ const ChatView: React.FC<ChatViewProps> = ({ status, messages, onSendMessage, on
 
   const MAX_IMAGES = 10;
   const MAX_IMAGE_MB = 8;
-  const MAX_IMAGE_EDGE = 2048;
+  const MAX_IMAGE_EDGE = 1024;
 
   // 1. SCROLL STATE TRACKING
   const handleScroll = () => {
