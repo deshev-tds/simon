@@ -869,6 +869,11 @@ async def process_and_stream_response(
         "reason": gate_decision.reason,
         **(gate_decision.metrics or {}),
     }
+    if RLM_TRACE:
+        try:
+            log_console(f"RLM gate: {json.dumps(metrics['rlm_gate'], ensure_ascii=False)}", "TRACE")
+        except Exception:
+            log_console(f"RLM gate: {metrics.get('rlm_gate')}", "TRACE")
     is_deep_mode = gate_decision.trigger
 
     current_messages = []

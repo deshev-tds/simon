@@ -30,7 +30,7 @@ _RE_COMPLEX = re.compile(
     re.IGNORECASE,
 )
 _RE_HIGH_RISK = re.compile(
-    r"\b(code|token|key|password|auth|authentication|api key|access code|pin)\b",
+    r"\b(code|key|password|auth|authentication|api key|access code|pin)\b",
     re.IGNORECASE,
 )
 

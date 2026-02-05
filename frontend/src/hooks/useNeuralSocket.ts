@@ -327,6 +327,7 @@ export const useNeuralSocket = () => {
     setIsAwaitingResponse(false);
     const activeId = streamingMessageIdRef.current;
     if (!activeId) {
+      console.log('STREAM:AI first delta');
       const id = Date.now().toString() + Math.random();
       streamingMessageIdRef.current = id;
       setMessages(prev => [...prev, {
