@@ -1465,102 +1465,69 @@ async def process_and_stream_response(
                         stream_start = time.time()
                         use_stream = not (is_deep_mode and not RLM_STREAM)
                         if use_stream:
-                        stream = client.chat.completions.create(
-                            model=model_name,
-                            messages=final_messages,
-                            temperature=0.2 if is_deep_mode else 0.7,
-                            stream=True
-                        )
+                            stream = client.chat.completions.create(
+                                model=model_name,
+                                messages=final_messages,
+                                temperature=0.2 if is_deep_mode else 0.7,
+                                stream=True
+                            )
 
-                        delta_buffer = ""
-                        last_flush = time.monotonic()
-                        current_sentence = ""
-                        saw_delta = False
-                        first_token_logged = False
-
-                        def handle_token(token: str):
-                            nonlocal final_text_buffer, delta_buffer, last_flush, current_sentence, saw_delta, first_token_logged
-                            if metrics.get("ttft") is None:
-                                metrics["ttft"] = time.time() - stream_start
-                            saw_delta = True
-                            if not first_token_logged:
-                                first_token_logged = True
-                                if RLM_TRACE:
-                                    try:
-                                        log_console("STREAM: first token emitted", "TRACE")
-                                    except Exception:
-                                        pass
-                            final_text_buffer += token
-                            if emit_text_deltas:
-                                delta_buffer += token
-                                now = time.monotonic()
-                                if len(delta_buffer) >= STREAM_FLUSH_CHARS or (now - last_flush) >= STREAM_FLUSH_SECS:
-                                    send_delta(delta_buffer)
-                                    delta_buffer = ""
-                                    last_flush = now
-                            if generate_audio:
-                                current_sentence += token
-                                if sentence_endings.search(current_sentence[-2:]) and len(current_sentence.strip()) > 5:
-                                    raw_t = current_sentence.strip()
-                                    clean_t = re.sub(r"[*#_`~]+", "", raw_t).strip()
-                                    if clean_t:
-                                        enqueue_text(clean_t)
-                                    current_sentence = ""
-
-                        for chunk in stream:
-                            if stop_evt.is_set():
-                                break
-
-                            choices = getattr(chunk, "choices", None)
-                            if choices is None and isinstance(chunk, dict):
-                                choices = chunk.get("choices")
-                            if not choices:
-                                continue
-                            choice0 = choices[0]
-                            delta = getattr(choice0, "delta", None)
-                            if delta is None and isinstance(choice0, dict):
-                                delta = choice0.get("delta")
-                            if not delta:
-                                continue
-                            token = getattr(delta, "content", None)
-                            if token is None and isinstance(delta, dict):
-                                token = delta.get("content")
-                            if not token:
-                                continue
-                            handle_token(token)
-
-                        if emit_text_deltas and delta_buffer and not stop_evt.is_set():
-                            send_delta(delta_buffer)
-                        if generate_audio and current_sentence.strip() and not stop_evt.is_set():
-                            raw_t = current_sentence.strip()
-                            clean_t = re.sub(r"[*#_`~]+", "", raw_t).strip()
-                            if clean_t:
-                                enqueue_text(clean_t)
-
-                        if SSE_STREAM_FALLBACK and not saw_delta and not stop_evt.is_set():
-                            if RLM_TRACE:
-                                try:
-                                    log_console("STREAM: SSE fallback engaged", "TRACE")
-                                except Exception:
-                                    pass
-                            stream_start = time.time()
                             delta_buffer = ""
                             last_flush = time.monotonic()
                             current_sentence = ""
-                            sse_url = LM_STUDIO_URL.rstrip("/") + "/chat/completions"
-                            payload = {
-                                "model": model_name,
-                                "messages": final_messages,
-                                "temperature": 0.2 if is_deep_mode else 0.7,
-                                "stream": True,
-                            }
-                            saw_delta = _stream_sse_chat(
-                                sse_url,
-                                payload,
-                                handle_token,
-                                stop_evt,
-                                LLM_TIMEOUT_S,
-                            )
+                            saw_delta = False
+                            first_token_logged = False
+
+                            def handle_token(token: str):
+                                nonlocal final_text_buffer, delta_buffer, last_flush, current_sentence, saw_delta, first_token_logged
+                                if metrics.get("ttft") is None:
+                                    metrics["ttft"] = time.time() - stream_start
+                                saw_delta = True
+                                if not first_token_logged:
+                                    first_token_logged = True
+                                    if RLM_TRACE:
+                                        try:
+                                            log_console("STREAM: first token emitted", "TRACE")
+                                        except Exception:
+                                            pass
+                                final_text_buffer += token
+                                if emit_text_deltas:
+                                    delta_buffer += token
+                                    now = time.monotonic()
+                                    if len(delta_buffer) >= STREAM_FLUSH_CHARS or (now - last_flush) >= STREAM_FLUSH_SECS:
+                                        send_delta(delta_buffer)
+                                        delta_buffer = ""
+                                        last_flush = now
+                                if generate_audio:
+                                    current_sentence += token
+                                    if sentence_endings.search(current_sentence[-2:]) and len(current_sentence.strip()) > 5:
+                                        raw_t = current_sentence.strip()
+                                        clean_t = re.sub(r"[*#_`~]+", "", raw_t).strip()
+                                        if clean_t:
+                                            enqueue_text(clean_t)
+                                        current_sentence = ""
+
+                            for chunk in stream:
+                                if stop_evt.is_set():
+                                    break
+
+                                choices = getattr(chunk, "choices", None)
+                                if choices is None and isinstance(chunk, dict):
+                                    choices = chunk.get("choices")
+                                if not choices:
+                                    continue
+                                choice0 = choices[0]
+                                delta = getattr(choice0, "delta", None)
+                                if delta is None and isinstance(choice0, dict):
+                                    delta = choice0.get("delta")
+                                if not delta:
+                                    continue
+                                token = getattr(delta, "content", None)
+                                if token is None and isinstance(delta, dict):
+                                    token = delta.get("content")
+                                if not token:
+                                    continue
+                                handle_token(token)
 
                             if emit_text_deltas and delta_buffer and not stop_evt.is_set():
                                 send_delta(delta_buffer)
@@ -1569,11 +1536,44 @@ async def process_and_stream_response(
                                 clean_t = re.sub(r"[*#_`~]+", "", raw_t).strip()
                                 if clean_t:
                                     enqueue_text(clean_t)
-                            if not saw_delta and RLM_TRACE:
-                                try:
-                                    log_console("STREAM: no deltas after SSE fallback", "TRACE")
-                                except Exception:
-                                    pass
+
+                            if SSE_STREAM_FALLBACK and not saw_delta and not stop_evt.is_set():
+                                if RLM_TRACE:
+                                    try:
+                                        log_console("STREAM: SSE fallback engaged", "TRACE")
+                                    except Exception:
+                                        pass
+                                stream_start = time.time()
+                                delta_buffer = ""
+                                last_flush = time.monotonic()
+                                current_sentence = ""
+                                sse_url = LM_STUDIO_URL.rstrip("/") + "/chat/completions"
+                                payload = {
+                                    "model": model_name,
+                                    "messages": final_messages,
+                                    "temperature": 0.2 if is_deep_mode else 0.7,
+                                    "stream": True,
+                                }
+                                saw_delta = _stream_sse_chat(
+                                    sse_url,
+                                    payload,
+                                    handle_token,
+                                    stop_evt,
+                                    LLM_TIMEOUT_S,
+                                )
+
+                                if emit_text_deltas and delta_buffer and not stop_evt.is_set():
+                                    send_delta(delta_buffer)
+                                if generate_audio and current_sentence.strip() and not stop_evt.is_set():
+                                    raw_t = current_sentence.strip()
+                                    clean_t = re.sub(r"[*#_`~]+", "", raw_t).strip()
+                                    if clean_t:
+                                        enqueue_text(clean_t)
+                                if not saw_delta and RLM_TRACE:
+                                    try:
+                                        log_console("STREAM: no deltas after SSE fallback", "TRACE")
+                                    except Exception:
+                                        pass
                         else:
                             resp = client.chat.completions.create(
                                 model=model_name,
