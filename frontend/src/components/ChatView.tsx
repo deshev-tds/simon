@@ -1,12 +1,12 @@
 import React, { useEffect, useRef, useState, useLayoutEffect } from 'react';
-import { ConnectionStatus, Message } from '../types';
+import { ConnectionStatus, ImageAttachment, Message } from '../types';
 import MarkdownMessage from './MarkdownMessage';
-import { IconMenu, IconSend, IconTerminal, IconWifi, IconWifiOff, IconWaveform } from './Icons';
+import { IconImage, IconMenu, IconSend, IconTerminal, IconWifi, IconWifiOff, IconWaveform, IconX } from './Icons';
 
 interface ChatViewProps {
   status: ConnectionStatus;
   messages: Message[];
-  onSendMessage: (text: string) => void;
+  onSendMessage: (payload: { text: string; images?: ImageAttachment[] }) => void;
   onCallStart: () => void;
   onOpenDrawer: () => void;
   sessionTitle?: string;
@@ -25,11 +25,18 @@ const IconArrowDown: React.FC<{ className?: string }> = ({ className }) => (
 const ChatView: React.FC<ChatViewProps> = ({ status, messages, onSendMessage, onCallStart, onOpenDrawer, sessionTitle, isLoadingSession, isAwaitingResponse }) => {
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [inputValue, setInputValue] = useState('');
+  const [pendingImages, setPendingImages] = useState<(ImageAttachment & { previewUrl: string })[]>([]);
+  const [imageError, setImageError] = useState<string | null>(null);
   const [showScrollButton, setShowScrollButton] = useState(false);
   const [isUserAtBottom, setIsUserAtBottom] = useState(true);
   const hasStreamingMessage = messages.some((msg) => msg.sender === 'ai' && msg.isStreaming);
   const showIncomingIndicator = Boolean(isAwaitingResponse && !hasStreamingMessage);
+
+  const MAX_IMAGES = 10;
+  const MAX_IMAGE_MB = 8;
+  const MAX_IMAGE_EDGE = 2048;
 
   // 1. SCROLL STATE TRACKING
   const handleScroll = () => {
@@ -53,11 +60,113 @@ const ChatView: React.FC<ChatViewProps> = ({ status, messages, onSendMessage, on
     }
   }, [messages, isUserAtBottom]);
 
+  const buildDataUrl = (mime: string, base64: string) => {
+    if (base64.startsWith('data:')) return base64;
+    return `data:${mime};base64,${base64}`;
+  };
+
+  const processFile = async (file: File): Promise<(ImageAttachment & { previewUrl: string }) | null> => {
+    if (!file.type.startsWith('image/')) {
+      setImageError('Unsupported file type.');
+      return null;
+    }
+
+    const objectUrl = URL.createObjectURL(file);
+    const img = new Image();
+    img.src = objectUrl;
+    await new Promise<void>((resolve, reject) => {
+      img.onload = () => {
+        URL.revokeObjectURL(objectUrl);
+        resolve();
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(objectUrl);
+        reject(new Error('Image load failed'));
+      };
+    });
+
+    const maxEdge = Math.max(img.width, img.height);
+    const scale = maxEdge > MAX_IMAGE_EDGE ? MAX_IMAGE_EDGE / maxEdge : 1;
+    const width = Math.max(1, Math.round(img.width * scale));
+    const height = Math.max(1, Math.round(img.height * scale));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      setImageError('Failed to process image.');
+      return null;
+    }
+    ctx.drawImage(img, 0, 0, width, height);
+
+    const mime = 'image/jpeg';
+    let dataUrl = canvas.toDataURL(mime, 0.85);
+    let base64 = dataUrl.split(',')[1] || '';
+    let sizeBytes = Math.floor((base64.length * 3) / 4);
+
+    if (sizeBytes > MAX_IMAGE_MB * 1024 * 1024) {
+      dataUrl = canvas.toDataURL(mime, 0.7);
+      base64 = dataUrl.split(',')[1] || '';
+      sizeBytes = Math.floor((base64.length * 3) / 4);
+    }
+
+    if (sizeBytes > MAX_IMAGE_MB * 1024 * 1024) {
+      setImageError('Image too large after compression.');
+      return null;
+    }
+
+    return {
+      id: `${Date.now()}-${Math.random()}`,
+      mime,
+      data_b64: base64,
+      width,
+      height,
+      size_bytes: sizeBytes,
+      previewUrl: buildDataUrl(mime, base64),
+    };
+  };
+
+  const handleFilesSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
+
+    setImageError(null);
+    const remaining = MAX_IMAGES - pendingImages.length;
+    const slice = files.slice(0, remaining);
+    if (files.length > remaining) {
+      setImageError(`Only ${MAX_IMAGES} images allowed per message.`);
+    }
+
+    const results: (ImageAttachment & { previewUrl: string })[] = [];
+    for (const file of slice) {
+      try {
+        const processed = await processFile(file);
+        if (processed) results.push(processed);
+      } catch (err) {
+        setImageError('Failed to process an image.');
+      }
+    }
+    if (results.length > 0) {
+      setPendingImages(prev => [...prev, ...results].slice(0, MAX_IMAGES));
+    }
+    e.target.value = '';
+  };
+
+  const removePendingImage = (id: string) => {
+    setPendingImages(prev => prev.filter(img => img.id !== id));
+  };
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (inputValue.trim()) {
-      onSendMessage(inputValue);
+    if (inputValue.trim() || pendingImages.length > 0) {
+      onSendMessage({
+        text: inputValue,
+        images: pendingImages.map(({ previewUrl, ...rest }) => rest),
+      });
       setInputValue('');
+      setPendingImages([]);
+      setImageError(null);
       
       // Force scroll on user send
       setIsUserAtBottom(true);
@@ -147,7 +256,23 @@ const ChatView: React.FC<ChatViewProps> = ({ status, messages, onSendMessage, on
                     </div>
                   </div>
                 ) : (
-                  <span className="whitespace-pre-wrap">{msg.text}</span>
+                  <div className="space-y-2">
+                    {msg.images && msg.images.length > 0 && (
+                      <div className="grid grid-cols-2 gap-2">
+                        {msg.images.map((img, idx) => (
+                          <div key={`${msg.id}-img-${idx}`} className="overflow-hidden rounded-lg border border-white/10 bg-zinc-900/60">
+                            <img
+                              src={buildDataUrl(img.mime, img.data_b64)}
+                              alt="attachment"
+                              className="w-full h-full object-cover max-h-48"
+                              loading="lazy"
+                            />
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {msg.text && <span className="whitespace-pre-wrap">{msg.text}</span>}
+                  </div>
                 )}
               </div>
             </div>
@@ -180,7 +305,33 @@ const ChatView: React.FC<ChatViewProps> = ({ status, messages, onSendMessage, on
         </div>
 
         {/* Input Bar */}
-        <div className="p-4">
+        <div className="p-4 space-y-3">
+          {pendingImages.length > 0 && (
+            <div className="flex flex-wrap gap-2">
+              {pendingImages.map((img) => (
+                <div key={img.id} className="relative w-20 h-20 rounded-lg overflow-hidden border border-white/10 bg-zinc-900/70">
+                  <img src={img.previewUrl} alt="pending upload" className="w-full h-full object-cover" />
+                  <button
+                    type="button"
+                    onClick={() => removePendingImage(String(img.id))}
+                    className="absolute top-1 right-1 p-1 rounded-full bg-zinc-900/80 text-zinc-300 hover:text-white border border-white/10"
+                    aria-label="Remove image"
+                  >
+                    <IconX className="w-3 h-3" />
+                  </button>
+                </div>
+              ))}
+              <div className="flex items-center text-[10px] text-zinc-500 font-mono tracking-widest px-2">
+                {pendingImages.length} / {MAX_IMAGES}
+              </div>
+            </div>
+          )}
+          {imageError && (
+            <div className="text-[10px] text-danger/80 font-mono tracking-widest uppercase">
+              {imageError}
+            </div>
+          )}
+
           <form onSubmit={handleSubmit} className="flex flex-wrap items-center gap-3">
             <button
               type="button"
@@ -190,6 +341,24 @@ const ChatView: React.FC<ChatViewProps> = ({ status, messages, onSendMessage, on
             >
               <IconWaveform className="w-4 h-4" />
             </button>
+
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              className="flex-none shrink-0 p-3 rounded-full text-zinc-500 hover:text-accent hover:bg-white/5 transition-colors touch-manipulation"
+              aria-label="Attach images"
+            >
+              <IconImage className="w-4 h-4" />
+            </button>
+
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              multiple
+              className="hidden"
+              onChange={handleFilesSelected}
+            />
 
             <div className="flex-1 min-w-[12rem] flex items-center gap-2 bg-zinc-900/50 border border-white/5 rounded-full p-1 pl-4 backdrop-blur-md shadow-lg">
               <div className="flex-1 min-w-0">
@@ -204,9 +373,9 @@ const ChatView: React.FC<ChatViewProps> = ({ status, messages, onSendMessage, on
 
               <button
                 type="submit"
-                disabled={!inputValue.trim()}
+                disabled={!inputValue.trim() && pendingImages.length === 0}
                 className={`flex-none shrink-0 p-3 rounded-full transition-all duration-300 touch-manipulation ${
-                  inputValue.trim()
+                  inputValue.trim() || pendingImages.length > 0
                     ? 'bg-zinc-800 text-zinc-200 hover:text-accent'
                     : 'bg-transparent text-zinc-700 cursor-not-allowed'
                 }`}

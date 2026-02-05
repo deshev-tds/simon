@@ -557,6 +557,26 @@ def _extract_message_text(msg):
     return getattr(msg, "content", "") or ""
 
 
+def _build_user_message(user_text: str, image_payloads: list[dict] | None):
+    if not image_payloads:
+        return {"role": "user", "content": user_text}
+    parts = []
+    if user_text:
+        parts.append({"type": "text", "text": user_text})
+    else:
+        parts.append({"type": "text", "text": ""})
+    for img in image_payloads:
+        mime = (img.get("mime") or "image/jpeg").strip()
+        data_b64 = (img.get("data_b64") or "").strip()
+        if not data_b64:
+            continue
+        parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{data_b64}"},
+        })
+    return {"role": "user", "content": parts}
+
+
 def _needs_fallback(user_text: str, reply_text: str, gate_metrics: dict) -> bool:
     if not reply_text:
         return True
@@ -897,6 +917,7 @@ async def process_and_stream_response(
     metrics,
     stop_event,
     session_id,
+    image_payloads=None,
     generate_audio=True,
     *,
     client,
@@ -909,6 +930,10 @@ async def process_and_stream_response(
     if memory is None:
         import backend.memory as memory_mod
         memory = memory_mod.memory
+
+    store_user_text = user_text or ""
+    if image_payloads and not store_user_text.strip():
+        store_user_text = "[image]"
 
     t_ctx_start = time.time()
     retrieval_cache = _probe_retrieval(user_text, memory, session_id)
@@ -947,7 +972,7 @@ async def process_and_stream_response(
         current_messages = _with_system_prompt([
             {"role": "system", "content": _DEEP_SYSTEM_PROMPT},
             *deep_history,
-            {"role": "user", "content": user_text}
+            _build_user_message(user_text, image_payloads),
         ])
         tools_list = tools.SIMON_TOOLS
     else:
@@ -959,7 +984,7 @@ async def process_and_stream_response(
             session_id,
             retrieval_cache=retrieval_cache,
         )
-        current_messages = _with_system_prompt(context_msgs + [{"role": "user", "content": user_text}])
+        current_messages = _with_system_prompt(context_msgs + [_build_user_message(user_text, image_payloads)])
         tools_list = None
 
     metrics["ctx"] = time.time() - t_ctx_start
@@ -1586,7 +1611,7 @@ async def process_and_stream_response(
                 except Exception as e:
                     print(f"Streaming Error: {e}")
 
-            if (not is_deep_mode) and RLM_FALLBACK_ENABLED and (not generate_audio) and not stop_evt.is_set():
+            if (not is_deep_mode) and RLM_FALLBACK_ENABLED and (not generate_audio) and not image_payloads and not stop_evt.is_set():
                 final_text_buffer, _fallback_reason = _run_text_fallback(
                     final_text_buffer,
                     model_name,
@@ -1594,10 +1619,10 @@ async def process_and_stream_response(
                     stop_evt,
                 )
             response_holder["text"] = final_text_buffer
-            if session_id and user_text and final_text_buffer and len(history) == 0:
+            if session_id and store_user_text and final_text_buffer and len(history) == 0:
                 threading.Thread(
                     target=_maybe_set_session_title,
-                    args=(session_id, user_text, final_text_buffer, client, get_current_model),
+                    args=(session_id, store_user_text, final_text_buffer, client, get_current_model),
                     daemon=True,
                 ).start()
 
@@ -1638,7 +1663,7 @@ async def process_and_stream_response(
             metrics["output_chars"] = len(full_reply)
             if metrics.get("output_tokens") is None:
                 metrics["output_tokens"] = estimate_tokens_from_text(full_reply)
-            history.append({"role": "user", "content": user_text})
+            history.append({"role": "user", "content": store_user_text})
             history.append({"role": "assistant", "content": full_reply})
 
             if memory_intents.detect_memory_save(user_text):
@@ -1647,7 +1672,13 @@ async def process_and_stream_response(
                     target=_save_explicit_memory,
                     args=(history_snapshot, session_id, client, get_current_model, memory),
                 ).start()
-            threading.Thread(target=db.save_interaction, args=(session_id, user_text, full_reply)).start()
+            if image_payloads:
+                threading.Thread(
+                    target=db.save_interaction_with_attachments,
+                    args=(session_id, store_user_text, full_reply, image_payloads),
+                ).start()
+            else:
+                threading.Thread(target=db.save_interaction, args=(session_id, store_user_text, full_reply)).start()
 
             metrics["end_time"] = time.time()
             _trace_rlm_metrics(metrics)

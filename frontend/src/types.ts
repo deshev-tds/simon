@@ -12,6 +12,7 @@ export interface Message {
   timestamp: number;
   isSystem?: boolean;
   isStreaming?: boolean;
+  images?: ImageAttachment[];
 }
 
 export enum AppMode {
@@ -35,6 +36,16 @@ export interface StoredMessage {
   content: string;
   created_at?: number;
   tokens?: number;
+  attachments?: ImageAttachment[];
+}
+
+export interface ImageAttachment {
+  id?: string;
+  mime: string;
+  data_b64: string;
+  width?: number | null;
+  height?: number | null;
+  size_bytes?: number | null;
 }
 
 export interface LiveTranscript {
@@ -52,7 +63,7 @@ export interface SessionWindow {
 export interface NeuralSocketHook {
   status: ConnectionStatus;
   messages: Message[];
-  sendMessage: (text: string) => void;
+  sendMessage: (payload: { text: string; images?: ImageAttachment[] }) => void;
   connect: () => void;
   disconnect: () => void;
 }

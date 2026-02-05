@@ -90,6 +90,12 @@ def _get_int_env(name: str, default: int) -> int:
         return default
 
 
+MAX_IMAGES_PER_MESSAGE = _get_int_env("SIMON_MAX_IMAGES_PER_MESSAGE", 10)
+MAX_IMAGE_MB = _get_float_env("SIMON_MAX_IMAGE_MB", 8.0)
+MAX_IMAGE_EDGE = _get_int_env("SIMON_MAX_IMAGE_EDGE", 2048)
+IMAGE_DIR = DATA_DIR / "images"
+IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+
 MEM_SEED_LIMIT = _get_int_env("SIMON_MEM_SEED_LIMIT", 50000)
 MEM_MAX_ROWS = _get_int_env("SIMON_MEM_MAX_ROWS", MEM_SEED_LIMIT)
 MEM_PRUNE_INTERVAL_S = _get_int_env("SIMON_MEM_PRUNE_INTERVAL_S", 60)
@@ -158,6 +164,7 @@ __all__ = [
     "FRONTEND_PUBLIC_DIR",
     "CERTS_DIR",
     "DATA_DIR",
+    "IMAGE_DIR",
     "MODELS_DIR",
     "ESP_AUDIO_DIR",
     "SAVE_ESP_AUDIO",
@@ -199,6 +206,9 @@ __all__ = [
     "MEM_PRUNE_INTERVAL_S",
     "MEM_HOT_SESSION_LIMIT",
     "RAG_DEBUG_VERBOSE",
+    "MAX_IMAGES_PER_MESSAGE",
+    "MAX_IMAGE_MB",
+    "MAX_IMAGE_EDGE",
     "LLM_TIMEOUT_S",
     "AGENT_MAX_TURNS",
     "AGENT_TRIGGER_KEYWORDS",

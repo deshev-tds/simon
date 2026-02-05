@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { ConnectionStatus, LiveTranscript, Message, SessionSummary, StoredMessage } from '../types';
+import { ConnectionStatus, ImageAttachment, LiveTranscript, Message, SessionSummary, StoredMessage } from '../types';
 
 const DEFAULT_WS_PORT = 8000;
 const getSocketUrl = () => {
@@ -80,7 +80,8 @@ export const useNeuralSocket = () => {
     id: (m.id ?? `${Date.now()}${Math.random()}`).toString(),
     text: m.content,
     sender: m.role === 'assistant' ? 'ai' : 'user',
-    timestamp: m.created_at ? m.created_at * 1000 : Date.now()
+    timestamp: m.created_at ? m.created_at * 1000 : Date.now(),
+    images: Array.isArray(m.attachments) && m.attachments.length > 0 ? m.attachments : undefined,
   }), []);
 
   const loadSessionWindow = useCallback(async (sessionId: number) => {
@@ -313,12 +314,13 @@ export const useNeuralSocket = () => {
     }
   }, [isRecording]);
 
-  const addUserMessage = useCallback((text: string) => {
+  const addUserMessage = useCallback((text: string, images?: ImageAttachment[]) => {
     setMessages(prev => [...prev, {
       id: Date.now().toString() + Math.random(),
       text,
       sender: 'user',
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      images: images && images.length ? images : undefined,
     }]);
   }, []);
 
@@ -442,7 +444,21 @@ export const useNeuralSocket = () => {
           }
       }
       else if (text.startsWith('SYS:')) console.log(`%c[SYS] ${text}`, 'color: cyan');
-      else if (text.startsWith('LOG:User:')) addUserMessage(text.replace('LOG:User:', '').trim());
+      else if (text.startsWith('LOG:User:')) {
+          const payload = text.replace('LOG:User:', '').trim();
+          if (payload.startsWith('{')) {
+            try {
+              const parsed = JSON.parse(payload);
+              const msgText = typeof parsed?.text === 'string' ? parsed.text : '';
+              const images = Array.isArray(parsed?.images) ? parsed.images : undefined;
+              addUserMessage(msgText, images);
+            } catch (err) {
+              addUserMessage(payload);
+            }
+          } else {
+            addUserMessage(payload);
+          }
+      }
       else if (text.startsWith('STREAM:AI:')) appendAiDelta(text.slice('STREAM:AI:'.length));
       else if (text.startsWith('LOG:AI:')) {
           const payload = text.slice('LOG:AI:'.length);
@@ -490,12 +506,54 @@ export const useNeuralSocket = () => {
     socketRef.current = ws;
   }, [addUserMessage, appendAiDelta, finalizeAiMessage, finalizeStreamingMessage, handleBinaryMessage, loadSessionWindow, persistSessionId, refreshSessions, socketCandidates]);
 
-  const sendMessage = useCallback((text: string) => {
+  const sendMessage = useCallback(async (payload: { text: string; images?: ImageAttachment[] }) => {
+    const text = (payload?.text ?? '').trim();
+    const images = Array.isArray(payload?.images) ? payload.images : [];
+    if (!text && images.length === 0) return;
+
     if (socketRef.current?.readyState === WebSocket.OPEN) {
+      if (images.length > 0) {
+        socketRef.current.send(JSON.stringify({
+          type: 'chat',
+          prompt: text,
+          images,
+        }));
+      } else {
         socketRef.current.send(text);
-        setIsAwaitingResponse(true);
+      }
+      setIsAwaitingResponse(true);
+      return;
     }
-  }, []);
+
+    try {
+      addUserMessage(text, images);
+      setIsAwaitingResponse(true);
+      const res = await callApi('/v1/chat/vision', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt: text,
+          images,
+          session_id: currentSessionIdRef.current,
+        }),
+      });
+      const data = await res.json();
+      const content = data?.choices?.[0]?.message?.content ?? '';
+      finalizeAiMessage(content);
+      if (typeof data?.session_id === 'number') {
+        persistSessionId(data.session_id);
+        await loadSessionWindow(data.session_id);
+        await refreshSessions();
+      } else {
+        await refreshSessions();
+      }
+    } catch (err) {
+      console.error('REST fallback failed', err);
+      finalizeAiMessage('Error: failed to reach server.');
+    } finally {
+      setIsAwaitingResponse(false);
+    }
+  }, [addUserMessage, callApi, finalizeAiMessage, loadSessionWindow, persistSessionId, refreshSessions]);
 
   useEffect(() => {
     connect();

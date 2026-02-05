@@ -1,7 +1,9 @@
+import base64
 import re
 import sqlite3
 import threading
 import time
+from pathlib import Path
 
 from backend.config import (
     ANCHOR_MESSAGES,
@@ -22,6 +24,7 @@ from backend.config import (
     MEM_SEED_LIMIT,
     MEM_HOT_SESSION_LIMIT,
     TEST_MODE,
+    IMAGE_DIR,
 )
 
 db_lock = threading.Lock()
@@ -79,6 +82,22 @@ def init_db(db_path=DB_PATH):
                 pass
             db_path.unlink(missing_ok=True)
         else:
+            existing_conn.execute("""
+                CREATE TABLE IF NOT EXISTS message_attachments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id INTEGER NOT NULL,
+                    kind TEXT NOT NULL DEFAULT 'image',
+                    path TEXT NOT NULL,
+                    mime TEXT,
+                    width INTEGER,
+                    height INTEGER,
+                    size_bytes INTEGER,
+                    created_at REAL DEFAULT (strftime('%s','now')),
+                    FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
+                )
+            """)
+            existing_conn.execute("CREATE INDEX IF NOT EXISTS idx_attachments_message ON message_attachments(message_id)")
+            existing_conn.commit()
             db_conn = existing_conn
             return existing_conn
 
@@ -112,7 +131,22 @@ def init_db(db_path=DB_PATH):
             FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS message_attachments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id INTEGER NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'image',
+            path TEXT NOT NULL,
+            mime TEXT,
+            width INTEGER,
+            height INTEGER,
+            size_bytes INTEGER,
+            created_at REAL DEFAULT (strftime('%s','now')),
+            FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
+        )
+    """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_session_created ON messages(session_id, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_attachments_message ON message_attachments(message_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC)")
 
     conn.commit()
@@ -576,20 +610,68 @@ def get_session_transcript(session_id, max_chars=6000, conn=None, lock=None):
         return ""
 
 
+_ATTACHMENT_EXTS = {
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+}
+
+
+def _strip_data_url(data_b64: str) -> str:
+    if not data_b64:
+        return ""
+    if data_b64.startswith("data:"):
+        parts = data_b64.split(",", 1)
+        if len(parts) == 2:
+            return parts[1].strip()
+    return data_b64.strip()
+
+
+def _attachment_ext(mime: str | None) -> str:
+    if not mime:
+        return "bin"
+    return _ATTACHMENT_EXTS.get(mime.lower(), "bin")
+
+
+def _write_attachment_file(session_id: int, message_id: int, idx: int, data_b64: str, mime: str | None) -> tuple[str | None, int]:
+    raw_b64 = _strip_data_url(data_b64)
+    if not raw_b64:
+        return None, 0
+    try:
+        data = base64.b64decode(raw_b64, validate=False)
+    except Exception:
+        return None, 0
+    rel_dir = Path(str(session_id))
+    out_dir = IMAGE_DIR / rel_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ext = _attachment_ext(mime)
+    filename = f"{message_id}_{idx}.{ext}"
+    out_path = out_dir / filename
+    try:
+        out_path.write_bytes(data)
+    except Exception:
+        return None, 0
+    rel_path = str(rel_dir / filename)
+    return rel_path, len(data)
+
+
+def _insert_message(target_conn, session_id, role, content, tokens, created_at):
+    cur = target_conn.execute(
+        "INSERT INTO messages(session_id, role, content, tokens, created_at) VALUES (?, ?, ?, ?, ?)",
+        (session_id, role, content, tokens, created_at),
+    )
+    return int(cur.lastrowid)
+
+
 def save_interaction(session_id, user_text, ai_text, conn=None, mem=None, lock=None):
     ts = time.time()
     target_conn = _resolve_conn(conn)
     target_lock = _resolve_lock(lock)
     target_mem = mem if mem is not None else mem_conn
     with target_lock:
-        target_conn.execute(
-            "INSERT INTO messages(session_id, role, content, tokens, created_at) VALUES (?, ?, ?, ?, ?)",
-            (session_id, "user", user_text, 0, ts)
-        )
-        target_conn.execute(
-            "INSERT INTO messages(session_id, role, content, tokens, created_at) VALUES (?, ?, ?, ?, ?)",
-            (session_id, "assistant", ai_text, 0, ts)
-        )
+        _insert_message(target_conn, session_id, "user", user_text, 0, ts)
+        _insert_message(target_conn, session_id, "assistant", ai_text, 0, ts)
         target_conn.execute("UPDATE sessions SET updated_at=? WHERE id=?", (ts, session_id))
         target_conn.commit()
         if target_mem is not None:
@@ -599,14 +681,8 @@ def save_interaction(session_id, user_text, ai_text, conn=None, mem=None, lock=N
             if not allow_mem_write:
                 return
             try:
-                target_mem.execute(
-                    "INSERT INTO messages(session_id, role, content, tokens, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (session_id, "user", user_text, 0, ts)
-                )
-                target_mem.execute(
-                    "INSERT INTO messages(session_id, role, content, tokens, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (session_id, "assistant", ai_text, 0, ts)
-                )
+                _insert_message(target_mem, session_id, "user", user_text, 0, ts)
+                _insert_message(target_mem, session_id, "assistant", ai_text, 0, ts)
                 target_mem.commit()
                 if MEM_HOT_SESSION_LIMIT > 0:
                     cur = target_mem.execute(
@@ -636,12 +712,99 @@ def save_interaction(session_id, user_text, ai_text, conn=None, mem=None, lock=N
                     print(f"[WARN] In-memory DB insert failed: {_e}")
 
 
+def save_interaction_with_attachments(session_id, user_text, ai_text, attachments, conn=None, mem=None, lock=None):
+    ts = time.time()
+    target_conn = _resolve_conn(conn)
+    target_lock = _resolve_lock(lock)
+    target_mem = mem if mem is not None else mem_conn
+    attachments = attachments or []
+    with target_lock:
+        user_id = _insert_message(target_conn, session_id, "user", user_text, 0, ts)
+        _insert_message(target_conn, session_id, "assistant", ai_text, 0, ts)
+        for idx, att in enumerate(attachments):
+            if not isinstance(att, dict):
+                continue
+            rel_path, actual_size = _write_attachment_file(
+                int(session_id),
+                int(user_id),
+                int(idx),
+                str(att.get("data_b64") or ""),
+                att.get("mime"),
+            )
+            if not rel_path:
+                continue
+            mime = att.get("mime")
+            width = att.get("width")
+            height = att.get("height")
+            size_bytes = int(att.get("size_bytes") or actual_size or 0)
+            target_conn.execute(
+                """
+                INSERT INTO message_attachments(message_id, kind, path, mime, width, height, size_bytes, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, "image", rel_path, mime, width, height, size_bytes, ts),
+            )
+        target_conn.execute("UPDATE sessions SET updated_at=? WHERE id=?", (ts, session_id))
+        target_conn.commit()
+        if target_mem is not None:
+            allow_mem_write = mem is not None or (
+                mem_active_session_id is not None and int(session_id) == int(mem_active_session_id)
+            )
+            if not allow_mem_write:
+                return
+            try:
+                _insert_message(target_mem, session_id, "user", user_text, 0, ts)
+                _insert_message(target_mem, session_id, "assistant", ai_text, 0, ts)
+                target_mem.commit()
+            except Exception as _e:
+                if DEBUG_MODE:
+                    print(f"[WARN] In-memory DB insert failed: {_e}")
+
+
 def set_session_title(session_id, title, conn=None, lock=None):
     target_conn = _resolve_conn(conn)
     target_lock = _resolve_lock(lock)
     with target_lock:
         target_conn.execute("UPDATE sessions SET title=?, updated_at=? WHERE id=?", (title, time.time(), session_id))
         target_conn.commit()
+
+
+def _load_message_attachments(message_ids, conn):
+    if not message_ids:
+        return {}
+    placeholders = ",".join(["?"] * len(message_ids))
+    rows = conn.execute(
+        f"""
+        SELECT message_id, kind, path, mime, width, height, size_bytes
+        FROM message_attachments
+        WHERE message_id IN ({placeholders})
+        ORDER BY id ASC
+        """,
+        tuple(message_ids),
+    ).fetchall()
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(row[0], []).append({
+            "kind": row[1],
+            "path": row[2],
+            "mime": row[3],
+            "width": row[4],
+            "height": row[5],
+            "size_bytes": row[6],
+        })
+    return grouped
+
+
+def _read_attachment_data(att):
+    rel_path = att.get("path")
+    if not rel_path:
+        return None
+    file_path = IMAGE_DIR / rel_path
+    try:
+        data = file_path.read_bytes()
+    except Exception:
+        return None
+    return base64.b64encode(data).decode("ascii")
 
 
 def get_session_window(session_id, anchor=ANCHOR_MESSAGES, recent=MAX_RECENT_MESSAGES, conn=None, lock=None):
@@ -667,14 +830,35 @@ def get_session_window(session_id, anchor=ANCHOR_MESSAGES, recent=MAX_RECENT_MES
     anchor_ids = {r[0] for r in anchor_rows}
     recent_rows = [r for r in reversed(recent_rows) if r[0] not in anchor_ids]
 
+    message_ids = [r[0] for r in anchor_rows + recent_rows]
+    attachments = _load_message_attachments(message_ids, target_conn)
+
     def map_row(row):
-        return {
+        msg = {
             "id": row[0],
             "role": row[1],
             "content": row[2],
             "created_at": row[3],
             "tokens": row[4] or 0,
         }
+        if row[0] in attachments:
+            payloads = []
+            for att in attachments[row[0]]:
+                if att.get("kind") != "image":
+                    continue
+                data_b64 = _read_attachment_data(att)
+                if not data_b64:
+                    continue
+                payloads.append({
+                    "mime": att.get("mime"),
+                    "width": att.get("width"),
+                    "height": att.get("height"),
+                    "size_bytes": att.get("size_bytes"),
+                    "data_b64": data_b64,
+                })
+            if payloads:
+                msg["attachments"] = payloads
+        return msg
 
     return {
         "session": meta,
@@ -1148,6 +1332,7 @@ __all__ = [
     "load_session_messages",
     "get_session_transcript",
     "save_interaction",
+    "save_interaction_with_attachments",
     "set_session_title",
     "get_session_window",
     "_fts_tokenize",

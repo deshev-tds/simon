@@ -167,6 +167,38 @@ This forces the agent to be efficient. If it needs more info, it must refine its
 **Default prompt window (tunable):**
 - `ANCHOR_MESSAGES=10`, `MAX_RECENT_MESSAGES=10` (bump up/down based on memory and latency budget).
 
+### E. Vision + Image Messaging (Base64, No Uploads)
+
+Simon now supports **multi-image + prompt** messages for vision-capable models (e.g., Qwen3-VL GGUF). The frontend can capture from camera / gallery / files, shows previews, and sends images as **base64** with the prompt. The backend stores images on disk and injects them into the LLM as multimodal `image_url` parts.
+
+**Transport (WebSocket, primary):**
+```json
+{
+  "type": "chat",
+  "prompt": "Describe these photos",
+  "images": [
+    {
+      "mime": "image/jpeg",
+      "data_b64": "<base64>",
+      "width": 1280,
+      "height": 720,
+      "size_bytes": 345678
+    }
+  ]
+}
+```
+
+**REST fallback:** `POST /v1/chat/vision` with the same payload (plus optional `session_id`).
+
+**Storage:** images are saved to `DATA_DIR/images/{session_id}/{message_id}_{idx}.jpg` and linked via the `message_attachments` table. Session history returns attachments (as base64) so the chat UI can re-render past images.
+
+**Limits (configurable):**
+- `SIMON_MAX_IMAGES_PER_MESSAGE` (default `10`)
+- `SIMON_MAX_IMAGE_MB` (default `8`)
+- `SIMON_MAX_IMAGE_EDGE` (default `2048`)
+
+**Model input format:** the user message becomes a multimodal `content` array with `text` + `image_url` data URLs, which llama.cpp and OpenAI-compatible backends accept.
+
 ---
 
 ## 4. Resilience Engineering: Preemptive Fixes

@@ -336,6 +336,78 @@ def _serialize_chat_completion(model_name: str, content: str, usage=None):
     }
 
 
+_ALLOWED_IMAGE_MIME = {"image/jpeg", "image/jpg", "image/png", "image/webp"}
+
+
+def _strip_data_url(data_b64: str) -> tuple[str, str | None]:
+    if not data_b64:
+        return "", None
+    if data_b64.startswith("data:"):
+        head, _, tail = data_b64.partition(",")
+        mime = None
+        if head.startswith("data:") and ";base64" in head:
+            mime = head.split(":", 1)[1].split(";", 1)[0].strip()
+        return tail.strip(), mime
+    return data_b64.strip(), None
+
+
+def _approx_b64_size(raw_b64: str) -> int:
+    if not raw_b64:
+        return 0
+    return int(len(raw_b64) * 3 / 4)
+
+
+def _normalize_image_payloads(images) -> list[dict]:
+    if not images:
+        return []
+    if len(images) > MAX_IMAGES_PER_MESSAGE:
+        raise ValueError(f"Too many images (max {MAX_IMAGES_PER_MESSAGE}).")
+    normalized = []
+    for idx, img in enumerate(images):
+        if not isinstance(img, dict):
+            raise ValueError("Invalid image payload.")
+        raw_b64 = img.get("data_b64") or img.get("data") or ""
+        raw_b64 = str(raw_b64)
+        raw_b64, inferred_mime = _strip_data_url(raw_b64)
+        mime = (img.get("mime") or inferred_mime or "").lower().strip()
+        if not raw_b64:
+            raise ValueError("Image data is empty.")
+        if not mime:
+            raise ValueError("Image mime type is required.")
+        if mime not in _ALLOWED_IMAGE_MIME:
+            raise ValueError(f"Unsupported mime type: {mime}")
+        size_bytes = int(img.get("size_bytes") or _approx_b64_size(raw_b64))
+        if size_bytes > int(MAX_IMAGE_MB * 1024 * 1024):
+            raise ValueError(f"Image exceeds {MAX_IMAGE_MB}MB limit.")
+        normalized.append({
+            "id": img.get("id") or f"img-{idx}",
+            "mime": mime,
+            "data_b64": raw_b64,
+            "width": img.get("width"),
+            "height": img.get("height"),
+            "size_bytes": size_bytes,
+        })
+    return normalized
+
+
+def _build_vision_content(prompt: str, images: list[dict]):
+    parts = []
+    if prompt:
+        parts.append({"type": "text", "text": prompt})
+    else:
+        parts.append({"type": "text", "text": ""})
+    for img in images or []:
+        mime = img.get("mime") or "image/jpeg"
+        data_b64 = img.get("data_b64") or ""
+        if not data_b64:
+            continue
+        parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{data_b64}"},
+        })
+    return parts
+
+
 def _sanitize_client_messages(messages):
     cleaned = []
     for msg in messages or []:
@@ -438,6 +510,56 @@ async def chat_endpoint(request: Request):
     except Exception as e:
         log_console(f"Chat completion failed: {e}", "ERR")
         return JSONResponse(content={"error": "chat_failed", "message": str(e)}, status_code=500)
+
+
+@app.post("/v1/chat/vision")
+async def vision_chat_endpoint(request: Request):
+    try:
+        data = await request.json()
+        prompt = (data.get("prompt") or data.get("text") or "").strip()
+        images = _normalize_image_payloads(data.get("images") or [])
+        if not prompt and not images:
+            return JSONResponse(content={"error": "empty_input", "message": "No prompt or images provided."}, status_code=400)
+
+        session_id = data.get("session_id")
+        if session_id is not None and session_exists(session_id):
+            current_id = session_id
+        else:
+            current_id = create_session(None)
+
+        history = load_session_messages(current_id)
+        metrics = {}
+        context_msgs, _rag_payload = build_rag_context(
+            prompt,
+            history,
+            memory,
+            metrics,
+            current_id,
+            retrieval_cache=None,
+        )
+        user_msg = {"role": "user", "content": _build_vision_content(prompt, images)}
+        messages = _prepend_system_prompt(context_msgs + [user_msg])
+
+        model_name = get_current_model()
+        resp = client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            temperature=0.7,
+            stream=False,
+        )
+        ai_text = resp.choices[0].message.content or ""
+        store_user_text = prompt or "[image]"
+        if images:
+            db.save_interaction_with_attachments(current_id, store_user_text, ai_text, images)
+        else:
+            db.save_interaction(current_id, store_user_text, ai_text)
+
+        payload = _serialize_chat_completion(model_name, ai_text, getattr(resp, "usage", None))
+        payload["session_id"] = current_id
+        return payload
+    except Exception as e:
+        log_console(f"Vision chat failed: {e}", "ERR")
+        return JSONResponse(content={"error": "vision_chat_failed", "message": str(e)}, status_code=500)
 
 
 @app.post("/v1/audio/speech")
@@ -963,6 +1085,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 metrics,
                                 stop_event,
                                 current_session_id,
+                                image_payloads=None,
                                 generate_audio=True,
                                 client=client,
                                 kokoro=kokoro,
@@ -973,6 +1096,50 @@ async def websocket_endpoint(websocket: WebSocket):
                             )
                         )
                         _reset_recording_markers()
+                        continue
+
+                    parsed_payload = None
+                    if text_msg and text_msg.lstrip().startswith("{"):
+                        try:
+                            parsed_payload = json.loads(text_msg)
+                        except Exception:
+                            parsed_payload = None
+
+                    if isinstance(parsed_payload, dict) and parsed_payload.get("type") in {"chat", "vision"}:
+                        try:
+                            user_text = (parsed_payload.get("prompt") or parsed_payload.get("text") or "").strip()
+                            image_payloads = _normalize_image_payloads(parsed_payload.get("images") or [])
+                        except Exception as exc:
+                            await websocket.send_text(f"LOG:AI: Error: {exc}")
+                            await websocket.send_text("DONE")
+                            continue
+
+                        if not user_text and not image_payloads:
+                            await websocket.send_text("LOG:AI: Error: empty message.")
+                            await websocket.send_text("DONE")
+                            continue
+
+                        log_payload = {"text": user_text, "images": image_payloads}
+                        await websocket.send_text(f"LOG:User: {json.dumps(log_payload)}")
+                        metrics = init_metrics("text", current_session_id)
+                        current_task = asyncio.create_task(
+                            process_and_stream_response(
+                                user_text,
+                                websocket,
+                                session_history,
+                                metrics,
+                                stop_event,
+                                current_session_id,
+                                image_payloads=image_payloads,
+                                generate_audio=False,
+                                client=client,
+                                kokoro=kokoro,
+                                memory=memory,
+                                build_rag_context=build_rag_context,
+                                log_console=log_console,
+                                get_current_model=get_current_model,
+                            )
+                        )
                         continue
 
                     # --- TEXT CHAT HANDLER (SILENT MODE) ---
@@ -989,6 +1156,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                     metrics,
                                     stop_event,
                                     current_session_id,
+                                    image_payloads=None,
                                     generate_audio=False,
                                     client=client,
                                     kokoro=kokoro,
