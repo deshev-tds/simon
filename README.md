@@ -121,7 +121,7 @@ Simon uses an explicit gate to decide when to pay the latency cost of deep/recur
 
 **Signals:**
 - **Context debt:** estimated session tokens ÷ window tokens.
-- **Recall / complexity intent:** keywords like "remember", "compare", "timeline", "сравни".
+- **Recall / complexity intent:** explicit recall phrases (e.g., `/memory:`, `/archive:`, "remember from previous messages") force Deep Mode. Softer recall phrasing only escalates when retrieval is weak, to avoid false positives.
 - **Retrieval confidence:** weak FTS (bm25) and/or zero hits; vector is used only as a fallback when FTS is empty/weak.
 - **Recent window short-circuit:** if the query overlaps heavily with the last N turns, skip deep mode.
 - **Evidence-bound answers:** in deep mode, final answers must be grounded in tool evidence; if no evidence exists, the system replies `not found`. When the query asks for a single value (code/date/amount/email/phone/name/city/formula), the system extracts that value deterministically from evidence lines.
@@ -133,7 +133,9 @@ Simon uses an explicit gate to decide when to pay the latency cost of deep/recur
 
 **Rule of thumb:**
 - Explicit intent → deep mode.
-- (Recall or complex) + (high debt or weak retrieval) → deep mode.
+- Explicit recall → deep mode.
+- Soft recall + weak retrieval → deep mode.
+- Complex + (high debt or weak retrieval) → deep mode.
 - High debt override if the user is asking about the past.
 
 **Env knobs:**
@@ -163,7 +165,7 @@ Recursive models suffer from "Context Explosion." If an agent queries a document
 This forces the agent to be efficient. If it needs more info, it must refine its search query (recursion) rather than dumping the whole database into RAM.
 
 **Default prompt window (tunable):**
-- `ANCHOR_MESSAGES=2`, `MAX_RECENT_MESSAGES=2` (current experiment to keep KV pressure low; increase as needed).
+- `ANCHOR_MESSAGES=10`, `MAX_RECENT_MESSAGES=10` (bump up/down based on memory and latency budget).
 
 ---
 

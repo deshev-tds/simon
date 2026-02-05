@@ -14,8 +14,15 @@ from backend.config import (
 )
 
 
-_RE_RECALL = re.compile(
-    r"\b(last time|earlier|previous|remember|discussed|said|told|преди|помниш|каза)\b",
+_RE_RECALL_EXPLICIT = re.compile(
+    r"(^/(memory|archive):|\bremember from (previous|earlier) (messages|chats|conversations)\b|"
+    r"\bfrom previous (messages|chats|conversations)\b|\bfrom earlier (messages|chats|conversations)\b|"
+    r"\bsearch memory\b|\buse memory\b|\bcheck memory\b|\bmemory recall\b)",
+    re.IGNORECASE,
+)
+_RE_RECALL_SOFT = re.compile(
+    r"\b(do you remember|remember when|remember what|have we talked|did we talk|"
+    r"have we discussed|did we discuss|last time|earlier|previous conversation)\b",
     re.IGNORECASE,
 )
 _RE_COMPLEX = re.compile(
@@ -90,14 +97,18 @@ class RLMGatekeeper:
         if any(k in query_lower for k in AGENT_TRIGGER_KEYWORDS):
             return GateDecision(True, "explicit_intent", {"query_len": query_len})
 
+        explicit_recall = bool(_RE_RECALL_EXPLICIT.search(query))
+        if explicit_recall:
+            return GateDecision(True, "explicit_recall", {"query_len": query_len})
+
         if _likely_in_recent_window(query, ctx.recent_history):
             return GateDecision(False, "likely_in_recent_window", {"query_len": query_len})
 
-        is_recall = bool(_RE_RECALL.search(query))
+        soft_recall = bool(_RE_RECALL_SOFT.search(query))
         is_complex = bool(_RE_COMPLEX.search(query))
         is_high_risk = bool(_RE_HIGH_RISK.search(query))
 
-        if query_len < RLM_MIN_QUERY_LEN and not is_recall and not is_complex:
+        if query_len < RLM_MIN_QUERY_LEN and not soft_recall and not is_complex:
             return GateDecision(False, "query_too_short", {"query_len": query_len})
 
         debt_ratio = ctx.session_tokens / max(1, ctx.window_tokens)
@@ -113,22 +124,28 @@ class RLMGatekeeper:
 
         fts_weak = ctx.fts_hit_count < RLM_MIN_FTS_HITS
         is_weak_retrieval = vector_weak or fts_weak
+        recall_with_gap = soft_recall and is_weak_retrieval
 
         metrics = {
             "debt": round(debt_ratio, 2),
             "top_dist": round(top_dist, 3) if top_dist is not None else None,
             "fts_hits": ctx.fts_hit_count,
             "query_len": query_len,
-            "is_recall": is_recall,
+            "explicit_recall": explicit_recall,
+            "soft_recall": soft_recall,
+            "recall_with_gap": recall_with_gap,
             "is_complex": is_complex,
             "is_high_risk": is_high_risk,
             "weak_retrieval": is_weak_retrieval,
         }
 
-        if debt_ratio >= RLM_MAX_DEBT_RATIO and (is_recall or is_complex):
+        if debt_ratio >= RLM_MAX_DEBT_RATIO and (recall_with_gap or is_complex):
             return GateDecision(True, "high_debt_override", metrics)
 
-        if (is_recall or is_complex) and (debt_ratio >= RLM_MIN_DEBT_FOR_CHECK or is_weak_retrieval):
+        if recall_with_gap:
+            return GateDecision(True, "recall_with_gap", metrics)
+
+        if is_complex and (debt_ratio >= RLM_MIN_DEBT_FOR_CHECK or is_weak_retrieval):
             return GateDecision(True, "complex_intent_with_context_gap", metrics)
 
         if is_high_risk and is_weak_retrieval:
