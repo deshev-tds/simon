@@ -23,6 +23,7 @@ from backend.config import (
     RLM_DEEP_HISTORY_MAX_MSGS,
     RLM_DEEP_HISTORY_MAX_CHARS,
     SKIP_VECTOR_MEMORY,
+    SYSTEM_PROMPT,
     TTS_VOICE,
 )
 from backend.metrics import (
@@ -78,6 +79,14 @@ _DEEP_SYSTEM_PROMPT = (
     "Answer ONLY from tool evidence above. If no evidence is found, reply exactly: not found. "
     "Do not hallucinate."
 )
+
+
+def _with_system_prompt(messages: list[dict]) -> list[dict]:
+    if not SYSTEM_PROMPT:
+        return messages
+    if messages and messages[0].get("role") == "system" and (messages[0].get("content") or "") == SYSTEM_PROMPT:
+        return messages
+    return [{"role": "system", "content": SYSTEM_PROMPT}] + messages
 
 _EVIDENCE_PATTERNS = {
     "code": _CODE_PATTERN,
@@ -868,11 +877,11 @@ async def process_and_stream_response(
         log_console("ACTIVATING AGENTIC LOOP", "AGENT")
         await websocket.send_text("SYS:THINKING: Entering Deep Mode...")
         deep_history = _select_deep_history(history)
-        current_messages = [
+        current_messages = _with_system_prompt([
             {"role": "system", "content": _DEEP_SYSTEM_PROMPT},
             *deep_history,
             {"role": "user", "content": user_text}
-        ]
+        ])
         tools_list = tools.SIMON_TOOLS
     else:
         context_msgs, rag_payload = build_rag_context(
@@ -883,7 +892,7 @@ async def process_and_stream_response(
             session_id,
             retrieval_cache=retrieval_cache,
         )
-        current_messages = context_msgs + [{"role": "user", "content": user_text}]
+        current_messages = _with_system_prompt(context_msgs + [{"role": "user", "content": user_text}])
         tools_list = None
 
     metrics["ctx"] = time.time() - t_ctx_start
@@ -919,11 +928,11 @@ async def process_and_stream_response(
             fallback_reason = "answer_inadequate"
             await websocket.send_text("SYS:THINKING: Entering Deep Mode...")
             deep_history = _select_deep_history(history)
-            deep_messages = [
+            deep_messages = _with_system_prompt([
                 {"role": "system", "content": _DEEP_SYSTEM_PROMPT},
                 *deep_history,
                 {"role": "user", "content": user_text}
-            ]
+            ])
             tool_chars_used = 0
             turn_count = 0
             auto_hop_used = False

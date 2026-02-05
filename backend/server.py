@@ -351,6 +351,14 @@ def _sanitize_client_messages(messages):
     return cleaned
 
 
+def _prepend_system_prompt(messages):
+    if not SYSTEM_PROMPT:
+        return messages
+    if messages and messages[0].get("role") == "system" and (messages[0].get("content") or "") == SYSTEM_PROMPT:
+        return messages
+    return [{"role": "system", "content": SYSTEM_PROMPT}] + (messages or [])
+
+
 # --- OPENAI-COMPATIBLE REST ENDPOINTS (ESP32) ---
 @app.post("/v1/audio/transcriptions")
 async def transcribe_endpoint(
@@ -415,6 +423,7 @@ async def chat_endpoint(request: Request):
     try:
         data = await request.json()
         messages = _sanitize_client_messages(data.get("messages", []))
+        messages = _prepend_system_prompt(messages)
         model_name = get_current_model()
         temperature = data.get("temperature", 0.7)
 

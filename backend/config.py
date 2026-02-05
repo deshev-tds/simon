@@ -47,6 +47,13 @@ CORPUS_DB_PATH = DATA_DIR / "corpus.db"
 WHISPER_MODEL_NAME = "distil-medium.en"
 TTS_VOICE = "bm_fable"
 DEFAULT_LLM_MODEL = _get_str_env("SIMON_DEFAULT_LLM_MODEL", "")
+SYSTEM_PROMPT_FILE = _get_str_env("SIMON_SYSTEM_PROMPT_FILE", "")
+SYSTEM_PROMPT = _get_str_env("SIMON_SYSTEM_PROMPT", "")
+if SYSTEM_PROMPT_FILE:
+    try:
+        SYSTEM_PROMPT = Path(SYSTEM_PROMPT_FILE).read_text(encoding="utf-8").strip()
+    except Exception:
+        pass
 
 MAX_RECENT_MESSAGES = 2
 ANCHOR_MESSAGES = 2
@@ -160,6 +167,8 @@ __all__ = [
     "WHISPER_MODEL_NAME",
     "TTS_VOICE",
     "DEFAULT_LLM_MODEL",
+    "SYSTEM_PROMPT_FILE",
+    "SYSTEM_PROMPT",
     "MAX_RECENT_MESSAGES",
     "ANCHOR_MESSAGES",
     "RAG_THRESHOLD",
