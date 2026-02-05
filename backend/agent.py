@@ -23,6 +23,7 @@ from backend.config import (
     RLM_DEEP_HISTORY_MAX_MSGS,
     RLM_DEEP_HISTORY_MAX_CHARS,
     SKIP_VECTOR_MEMORY,
+    STREAM_TEXT_WITH_AUDIO,
     SYSTEM_PROMPT,
     TTS_VOICE,
 )
@@ -1143,7 +1144,7 @@ async def process_and_stream_response(
             await websocket.send_text("DONE")
         return
 
-    emit_text_deltas = not generate_audio
+    emit_text_deltas = (not generate_audio) or STREAM_TEXT_WITH_AUDIO
     emit_final_text = True
     emit_tts_text = False
 
