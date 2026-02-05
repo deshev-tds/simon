@@ -133,6 +133,7 @@ RLM_DEEP_HISTORY_MAX_CHARS = _get_int_env("SIMON_RLM_DEEP_HISTORY_MAX_CHARS", 60
 RLM_TRACE = os.environ.get("SIMON_RLM_TRACE", "0") == "1"
 RLM_STREAM = os.environ.get("SIMON_RLM_STREAM", "1") == "1"
 STREAM_TEXT_WITH_AUDIO = os.environ.get("SIMON_STREAM_TEXT_WITH_AUDIO", "1") == "1"
+SSE_STREAM_FALLBACK = os.environ.get("SIMON_SSE_STREAM_FALLBACK", "1") == "1"
 
 LIVE_STT_ENABLED = os.environ.get("SIMON_LIVE_STT_ENABLED", "1") == "1"
 LIVE_STT_WINDOW_S = _get_float_env("SIMON_LIVE_STT_WINDOW_S", 30.0)
@@ -217,6 +218,7 @@ __all__ = [
     "RLM_TRACE",
     "RLM_STREAM",
     "STREAM_TEXT_WITH_AUDIO",
+    "SSE_STREAM_FALLBACK",
     "LIVE_STT_ENABLED",
     "LIVE_STT_WINDOW_S",
     "LIVE_STT_STEP_S",
