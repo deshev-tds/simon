@@ -17,12 +17,22 @@ need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
 need_cmd toolbox
 
 TOOLBOX_CONTAINER="${SIMON_LLAMA_TOOLBOX_CONTAINER:-llama-rocm-7.2}"
-# This path must exist *inside the toolbox container*. In practice $HOME is mounted in.
 RUN_LLAMA_IN_CONTAINER="${SIMON_LLAMA_RUN_LLAMA_IN_CONTAINER:-$HOME/run_llama.sh}"
 
 MODELS_DIR="${SIMON_LLAMA_MODELS_DIR:-}"
 HOST="${SIMON_LLAMA_HOST:-}"
 PORT="${SIMON_LLAMA_PORT:-}"
+
+# When called via sudo, rootless podman/toolbox often need these set.
+if [[ -z "${XDG_RUNTIME_DIR:-}" || ! -d "${XDG_RUNTIME_DIR:-}" ]]; then
+  export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+fi
+if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" && -S "${XDG_RUNTIME_DIR}/bus" ]]; then
+  export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+fi
+
+# Avoid toolbox trying (and failing) to chdir into paths not mounted in the container (e.g. /opt/simon).
+cd "${SIMON_LLAMA_HOST_CWD:-$HOME}" || die "Failed to cd to host cwd"
 
 extra_env=()
 [[ -n "$MODELS_DIR" ]] && extra_env+=("MODELS_DIR=$MODELS_DIR")
@@ -44,6 +54,18 @@ case "$cmd" in
     ;;
 esac
 
-# Important: pass args as an argv array (no bash -lc, no string concatenation).
-exec env "${extra_env[@]}" toolbox run -c "$TOOLBOX_CONTAINER" "$RUN_LLAMA_IN_CONTAINER" "$cmd" "$@"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+host_run_llama="$script_dir/run_llama.sh"
+if [[ ! -f "$host_run_llama" ]]; then
+  die "Host run_llama.sh not found at: $host_run_llama"
+fi
 
+# Prefer an in-container script path if the user explicitly provides one,
+# but fall back to piping the host script into the container so we don't
+# depend on /home being mounted or symlinks resolving inside the container.
+if [[ -n "${SIMON_LLAMA_RUN_LLAMA_IN_CONTAINER:-}" ]]; then
+  exec env "${extra_env[@]}" toolbox run -c "$TOOLBOX_CONTAINER" "$RUN_LLAMA_IN_CONTAINER" "$cmd" "$@"
+fi
+
+# Important: pass args as an argv array (no string concatenation).
+exec env "${extra_env[@]}" toolbox run -c "$TOOLBOX_CONTAINER" bash -s -- "$cmd" "$@" <"$host_run_llama"

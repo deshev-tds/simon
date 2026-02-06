@@ -873,7 +873,8 @@ def _llama_ctl_cmd(args: list[str]) -> list[str]:
         raise RuntimeError(f"llama_ctl.sh not found at: {LLAMA_CTL_PATH}")
     base = [str(LLAMA_CTL_PATH), *args]
     if LLAMA_SUDO_USER:
-        return ["sudo", "-n", "-u", LLAMA_SUDO_USER, *base]
+        # -H sets HOME for the target user; important for rootless toolbox/podman.
+        return ["sudo", "-n", "-H", "-u", LLAMA_SUDO_USER, *base]
     return base
 
 
