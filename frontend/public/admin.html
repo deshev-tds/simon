@@ -54,6 +54,15 @@
         font-family: inherit;
         font-size: 12px;
       }
+      .field select {
+        min-width: 220px;
+        padding: 4px 6px;
+        border: 1px solid var(--border);
+        background: Canvas;
+        color: CanvasText;
+        font-family: inherit;
+        font-size: 12px;
+      }
       .field button {
         padding: 4px 8px;
         border: 1px solid var(--border);
@@ -99,6 +108,29 @@
           <button id="resetApi">Reset</button>
         </div>
       </div>
+      <div class="box" style="min-width: 340px;">
+        <div class="muted">Llama Control</div>
+        <div id="llamaStatus" style="margin-top: 6px;">llama: -</div>
+        <div class="field" style="margin-top: 6px; flex-wrap: wrap;">
+          <button id="llamaRefresh">Scan</button>
+          <button id="llamaStatusBtn">Status</button>
+          <button id="llamaEject">Eject</button>
+        </div>
+        <div class="muted" style="margin-top: 8px;">Model</div>
+        <div class="field" style="margin-top: 6px;">
+          <select id="llamaModelSelect" style="min-width: 300px;"></select>
+        </div>
+        <div id="mmprojWrap" style="display: none; margin-top: 8px;">
+          <div class="muted">mmproj</div>
+          <div class="field" style="margin-top: 6px;">
+            <select id="llamaMmprojSelect" style="min-width: 300px;"></select>
+          </div>
+        </div>
+        <div class="field" style="margin-top: 8px;">
+          <button id="llamaSwitch">Switch (restart)</button>
+        </div>
+        <div id="llamaMsg" class="muted" style="margin-top: 6px; white-space: pre-wrap;"></div>
+      </div>
     </div>
     <table>
       <thead>
@@ -137,6 +169,15 @@
       const apiInput = document.getElementById('apiBase');
       const applyButton = document.getElementById('applyApi');
       const resetButton = document.getElementById('resetApi');
+      const llamaStatusEl = document.getElementById('llamaStatus');
+      const llamaRefreshBtn = document.getElementById('llamaRefresh');
+      const llamaStatusBtn = document.getElementById('llamaStatusBtn');
+      const llamaEjectBtn = document.getElementById('llamaEject');
+      const llamaSwitchBtn = document.getElementById('llamaSwitch');
+      const llamaModelSelect = document.getElementById('llamaModelSelect');
+      const mmprojWrap = document.getElementById('mmprojWrap');
+      const llamaMmprojSelect = document.getElementById('llamaMmprojSelect');
+      const llamaMsgEl = document.getElementById('llamaMsg');
 
       const STORAGE_KEY = 'simon_admin_api_base';
       const normalizeBase = (value) => value.replace(/\/+$/, '');
@@ -246,6 +287,127 @@
       };
 
       const getBase = () => (apiBase ? apiBase : location.origin);
+      const apiFetch = (path, init) => fetch(`${getBase()}${path}`, init);
+
+      // --- LLAMA CONTROL ---
+      let llamaModels = [];
+      let llamaLastStatus = null;
+
+      const setLlamaMsg = (text) => {
+        llamaMsgEl.textContent = text || '';
+      };
+
+      const renderMmproj = (model) => {
+        const mmprojs = Array.isArray(model?.mmprojs) ? model.mmprojs : [];
+        if (!mmprojs.length) {
+          mmprojWrap.style.display = 'none';
+          llamaMmprojSelect.innerHTML = '';
+          return;
+        }
+        mmprojWrap.style.display = 'block';
+        llamaMmprojSelect.innerHTML = '';
+        const none = document.createElement('option');
+        none.value = '';
+        none.textContent = '(none)';
+        llamaMmprojSelect.appendChild(none);
+        for (const mp of mmprojs) {
+          const opt = document.createElement('option');
+          opt.value = mp;
+          opt.textContent = mp.split('/').pop();
+          llamaMmprojSelect.appendChild(opt);
+        }
+      };
+
+      const populateModels = () => {
+        llamaModelSelect.innerHTML = '';
+        for (const m of llamaModels) {
+          const opt = document.createElement('option');
+          opt.value = m.path;
+          opt.textContent = m.rel || m.path;
+          llamaModelSelect.appendChild(opt);
+        }
+        const selected = llamaModels.find((m) => m.path === llamaModelSelect.value) || llamaModels[0];
+        renderMmproj(selected);
+      };
+
+      llamaModelSelect.addEventListener('change', () => {
+        const model = llamaModels.find((m) => m.path === llamaModelSelect.value);
+        renderMmproj(model);
+      });
+
+      const fetchLlamaStatus = async () => {
+        try {
+          const res = await apiFetch('/admin/llama/status');
+          const text = await res.text();
+          if (!res.ok) throw new Error(text || `HTTP ${res.status}`);
+          const data = JSON.parse(text);
+          llamaLastStatus = data;
+          const label = data?.running ? `RUNNING pid=${data.pid || '-'} port=${data.port || '-'}`
+                                     : 'STOPPED';
+          const model = data?.model_path ? ` model=${data.model_path.split('/').pop()}` : '';
+          llamaStatusEl.textContent = `llama: ${label}${model}`;
+          return data;
+        } catch (err) {
+          llamaStatusEl.textContent = `llama: error (${err.message})`;
+          return null;
+        }
+      };
+
+      const scanLlamaModels = async () => {
+        if (location.protocol === 'file:' && !apiBase) {
+          setLlamaMsg('Set API Base (file:// has no origin).');
+          return;
+        }
+        setLlamaMsg('Scanning models...');
+        try {
+          const res = await apiFetch('/admin/llama/models?refresh=1');
+          const text = await res.text();
+          if (!res.ok) throw new Error(text || `HTTP ${res.status}`);
+          const data = JSON.parse(text);
+          llamaModels = Array.isArray(data?.models) ? data.models : [];
+          populateModels();
+          setLlamaMsg(`Found ${llamaModels.length} model(s).`);
+        } catch (err) {
+          setLlamaMsg(`Scan failed: ${err.message}`);
+        }
+      };
+
+      const switchLlamaModel = async () => {
+        const model = llamaModelSelect.value || '';
+        const mmproj = (mmprojWrap.style.display === 'block') ? (llamaMmprojSelect.value || null) : null;
+        if (!model) {
+          setLlamaMsg('Pick a model first.');
+          return;
+        }
+        setLlamaMsg('Switching model (restart)...');
+        try {
+          const res = await apiFetch('/admin/llama/switch', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model, mmproj }),
+          });
+          const text = await res.text();
+          if (!res.ok) throw new Error(text || `HTTP ${res.status}`);
+          const data = JSON.parse(text);
+          setLlamaMsg(`Switched. Active OpenAI model id: ${data?.active_model || '-'}`);
+          await fetchLlamaStatus();
+        } catch (err) {
+          setLlamaMsg(`Switch failed: ${err.message}`);
+        }
+      };
+
+      const ejectLlama = async () => {
+        setLlamaMsg('Ejecting (stop server)...');
+        try {
+          const res = await apiFetch('/admin/llama/eject', { method: 'POST' });
+          const text = await res.text();
+          if (!res.ok) throw new Error(text || `HTTP ${res.status}`);
+          setLlamaMsg('Ejected (server stopped).');
+          await fetchLlamaStatus();
+        } catch (err) {
+          setLlamaMsg(`Eject failed: ${err.message}`);
+        }
+      };
 
       const tryFetch = async () => {
         const url = `${getBase()}/metrics?limit=50`;
@@ -356,8 +518,17 @@
         electLeader();
       });
 
+      llamaRefreshBtn.addEventListener('click', scanLlamaModels);
+      llamaStatusBtn.addEventListener('click', fetchLlamaStatus);
+      llamaSwitchBtn.addEventListener('click', switchLlamaModel);
+      llamaEjectBtn.addEventListener('click', ejectLlama);
+
       electLeader();
       setInterval(electLeader, 2000);
+
+      // Best-effort initial state.
+      fetchLlamaStatus();
+      scanLlamaModels();
     </script>
   </body>
 </html>

@@ -308,6 +308,11 @@ class ModelPayload(BaseModel):
     name: str
 
 
+class LlamaSwitchPayload(BaseModel):
+    model: str
+    mmproj: str | None = None
+
+
 def _safe_usage_dict(usage):
     if not usage:
         return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -855,6 +860,120 @@ async def get_metrics(limit: int = 50):
     with METRICS_LOCK:
         items = list(METRICS_HISTORY)[-max(1, min(limit, 500)):]
     return {"items": items, "count": len(items)}
+
+
+LLAMA_CTL_PATH = (ROOT_DIR / "scripts" / "llama_ctl.sh").resolve()
+LLAMA_SUDO_USER = os.environ.get("SIMON_LLAMA_SUDO_USER", "deshev").strip()
+LLAMA_READY_TIMEOUT_S = float(os.environ.get("SIMON_LLAMA_READY_TIMEOUT_S", "180").strip() or "180")
+LLAMA_CTL_TIMEOUT_S = float(os.environ.get("SIMON_LLAMA_CTL_TIMEOUT_S", "300").strip() or "300")
+
+
+def _llama_ctl_cmd(args: list[str]) -> list[str]:
+    if not LLAMA_CTL_PATH.exists():
+        raise RuntimeError(f"llama_ctl.sh not found at: {LLAMA_CTL_PATH}")
+    base = [str(LLAMA_CTL_PATH), *args]
+    if LLAMA_SUDO_USER:
+        return ["sudo", "-n", "-u", LLAMA_SUDO_USER, *base]
+    return base
+
+
+def _run_llama_ctl(args: list[str], timeout_s: float | None = None) -> subprocess.CompletedProcess:
+    cmd = _llama_ctl_cmd(args)
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s or LLAMA_CTL_TIMEOUT_S)
+
+
+def _wait_llama_ready(timeout_s: float) -> list[str]:
+    deadline = time.time() + max(1.0, timeout_s)
+    last_err: Exception | None = None
+    while time.time() < deadline:
+        try:
+            data = client.models.list()
+            raw_models = getattr(data, "data", data)
+            models: list[str] = []
+            for m in raw_models:
+                if m is None:
+                    continue
+                if hasattr(m, "id"):
+                    models.append(m.id)
+                elif isinstance(m, dict) and m.get("id"):
+                    models.append(m["id"])
+                elif isinstance(m, str):
+                    models.append(m)
+            if models:
+                return models
+        except Exception as exc:
+            last_err = exc
+        time.sleep(0.5)
+    raise RuntimeError(f"llama-server not ready after {timeout_s:.0f}s: {last_err}")
+
+
+@app.get("/admin/llama/models")
+async def admin_llama_models(refresh: int = 0):
+    # refresh is reserved for future caching; for now scans every call.
+    try:
+        result = await asyncio.to_thread(_run_llama_ctl, ["list", "--json"])
+        if result.returncode != 0:
+            msg = (result.stderr or result.stdout or "").strip()
+            return JSONResponse(content={"error": "llama_list_failed", "message": msg, "code": result.returncode}, status_code=500)
+        return JSONResponse(content=json.loads(result.stdout or "{}"))
+    except Exception as exc:
+        return JSONResponse(content={"error": "llama_list_error", "message": str(exc)}, status_code=500)
+
+
+@app.get("/admin/llama/status")
+async def admin_llama_status():
+    try:
+        result = await asyncio.to_thread(_run_llama_ctl, ["status", "--json"])
+        if result.returncode != 0:
+            msg = (result.stderr or result.stdout or "").strip()
+            return JSONResponse(content={"error": "llama_status_failed", "message": msg, "code": result.returncode}, status_code=500)
+        return JSONResponse(content=json.loads(result.stdout or "{}"))
+    except Exception as exc:
+        return JSONResponse(content={"error": "llama_status_error", "message": str(exc)}, status_code=500)
+
+
+@app.post("/admin/llama/eject")
+async def admin_llama_eject():
+    # Eject = stop llama-server process to free VRAM.
+    try:
+        result = await asyncio.to_thread(_run_llama_ctl, ["stop"])
+        if result.returncode != 0:
+            msg = (result.stderr or result.stdout or "").strip()
+            return JSONResponse(content={"error": "llama_eject_failed", "message": msg, "code": result.returncode}, status_code=500)
+        return {"status": "ok"}
+    except Exception as exc:
+        return JSONResponse(content={"error": "llama_eject_error", "message": str(exc)}, status_code=500)
+
+
+@app.post("/admin/llama/switch")
+async def admin_llama_switch(payload: LlamaSwitchPayload):
+    model_path = (payload.model or "").strip()
+    mmproj_path = (payload.mmproj or "").strip()
+    if not model_path:
+        return JSONResponse(content={"error": "empty_model", "message": "model is required"}, status_code=400)
+
+    args = ["restart", "--model", model_path]
+    if mmproj_path:
+        args += ["--mmproj", mmproj_path]
+    else:
+        # Make sure the script stays non-interactive even if it grows heuristics later.
+        args += ["--no-mmproj"]
+
+    try:
+        result = await asyncio.to_thread(_run_llama_ctl, args)
+        if result.returncode != 0:
+            msg = (result.stderr or result.stdout or "").strip()
+            return JSONResponse(content={"error": "llama_switch_failed", "message": msg, "code": result.returncode}, status_code=500)
+
+        # After restart, re-sync the OpenAI model id used by the backend.
+        models = await asyncio.to_thread(_wait_llama_ready, LLAMA_READY_TIMEOUT_S)
+        active = models[0] if models else get_current_model()
+        set_current_model(active)
+        await asyncio.to_thread(warm_model, active)
+
+        return {"status": "ok", "active_model": active, "models": models}
+    except Exception as exc:
+        return JSONResponse(content={"error": "llama_switch_error", "message": str(exc)}, status_code=500)
 
 
 @app.get("/models")
