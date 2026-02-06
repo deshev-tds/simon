@@ -864,7 +864,6 @@ async def get_metrics(limit: int = 50):
     return {"items": items, "count": len(items)}
 
 
-LLAMA_CONTROL_MODE = os.environ.get("SIMON_LLAMA_CONTROL_MODE", "router").strip().lower()
 LLAMA_ROUTER_TIMEOUT_S = float(os.environ.get("SIMON_LLAMA_ROUTER_TIMEOUT_S", "5").strip() or "5")
 LLAMA_SWITCH_EJECT_FIRST = os.environ.get("SIMON_LLAMA_SWITCH_EJECT_FIRST", "1") == "1"
 
@@ -918,190 +917,101 @@ def _llama_router_unload_model(model_id: str) -> dict:
     return _llama_router_request_json("POST", "/models/unload", {"model": model_id})
 
 
-# Toolbox control fallback (legacy)
-LLAMA_CTL_PATH = (ROOT_DIR / "scripts" / "llama_ctl.sh").resolve()
-LLAMA_SUDO_USER = os.environ.get("SIMON_LLAMA_SUDO_USER", "deshev").strip()
-LLAMA_READY_TIMEOUT_S = float(os.environ.get("SIMON_LLAMA_READY_TIMEOUT_S", "180").strip() or "180")
-LLAMA_CTL_TIMEOUT_S = float(os.environ.get("SIMON_LLAMA_CTL_TIMEOUT_S", "300").strip() or "300")
-
-
-def _llama_ctl_cmd(args: list[str]) -> list[str]:
-    if not LLAMA_CTL_PATH.exists():
-        raise RuntimeError(f"llama_ctl.sh not found at: {LLAMA_CTL_PATH}")
-    base = [str(LLAMA_CTL_PATH), *args]
-    if LLAMA_SUDO_USER:
-        # -H sets HOME for the target user; important for rootless toolbox/podman.
-        return ["sudo", "-n", "-H", "-u", LLAMA_SUDO_USER, *base]
-    return base
-
-
-def _run_llama_ctl(args: list[str], timeout_s: float | None = None) -> subprocess.CompletedProcess:
-    cmd = _llama_ctl_cmd(args)
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s or LLAMA_CTL_TIMEOUT_S)
-
-
-def _wait_llama_ready(timeout_s: float) -> list[str]:
-    deadline = time.time() + max(1.0, timeout_s)
-    last_err: Exception | None = None
-    while time.time() < deadline:
-        try:
-            data = client.models.list()
-            raw_models = getattr(data, "data", data)
-            models: list[str] = []
-            for m in raw_models:
-                if m is None:
-                    continue
-                if hasattr(m, "id"):
-                    models.append(m.id)
-                elif isinstance(m, dict) and m.get("id"):
-                    models.append(m["id"])
-                elif isinstance(m, str):
-                    models.append(m)
-            if models:
-                return models
-        except Exception as exc:
-            last_err = exc
-        time.sleep(0.5)
-    raise RuntimeError(f"llama-server not ready after {timeout_s:.0f}s: {last_err}")
-
-
 @app.get("/admin/llama/models")
 async def admin_llama_models(refresh: int = 0):
     # refresh is reserved for future caching; for now always hits the source of truth.
-    if LLAMA_CONTROL_MODE in {"router", "auto"}:
-        try:
-            models = await asyncio.to_thread(_llama_router_list_models)
-            return {
-                "ok": True,
-                "source": "router",
-                "base_url": _llama_http_base_url(),
-                "current": get_current_model(),
-                "count": len(models),
-                "models": models,
-            }
-        except HTTPError as exc:
-            if LLAMA_CONTROL_MODE != "auto":
-                if getattr(exc, "code", None) == 404:
-                    return JSONResponse(
-                        content={
-                            "error": "llama_router_unavailable",
-                            "message": "llama-server /models endpoint returned 404. Start llama-server in router mode (no -m, with --models-dir).",
-                        },
-                        status_code=400,
-                    )
-                return JSONResponse(
-                    content={"error": "llama_router_http_error", "message": str(exc), "code": getattr(exc, "code", None)},
-                    status_code=500,
-                )
-        except URLError as exc:
-            if LLAMA_CONTROL_MODE != "auto":
-                return JSONResponse(content={"error": "llama_router_unreachable", "message": str(exc)}, status_code=500)
-        except Exception as exc:
-            if LLAMA_CONTROL_MODE != "auto":
-                return JSONResponse(content={"error": "llama_router_error", "message": str(exc)}, status_code=500)
-
-    # Legacy toolbox scan (requires sudo/toolbox bridge).
     try:
-        result = await asyncio.to_thread(_run_llama_ctl, ["list", "--json"])
-        if result.returncode != 0:
-            msg = (result.stderr or result.stdout or "").strip()
-            return JSONResponse(content={"error": "llama_list_failed", "message": msg, "code": result.returncode}, status_code=500)
-        return JSONResponse(content=json.loads(result.stdout or "{}"))
+        models = await asyncio.to_thread(_llama_router_list_models)
+        return {
+            "ok": True,
+            "source": "router",
+            "base_url": _llama_http_base_url(),
+            "current": get_current_model(),
+            "count": len(models),
+            "models": models,
+        }
+    except HTTPError as exc:
+        if getattr(exc, "code", None) == 404:
+            return JSONResponse(
+                content={
+                    "error": "llama_router_unavailable",
+                    "message": "llama-server /models endpoint returned 404. Start llama-server in router mode (no -m, with --models-dir).",
+                },
+                status_code=400,
+            )
+        return JSONResponse(
+            content={"error": "llama_router_http_error", "message": str(exc), "code": getattr(exc, "code", None)},
+            status_code=500,
+        )
+    except URLError as exc:
+        return JSONResponse(content={"error": "llama_router_unreachable", "message": str(exc)}, status_code=500)
     except Exception as exc:
-        return JSONResponse(content={"error": "llama_list_error", "message": str(exc)}, status_code=500)
+        return JSONResponse(content={"error": "llama_router_error", "message": str(exc)}, status_code=500)
 
 
 @app.get("/admin/llama/status")
 async def admin_llama_status():
-    if LLAMA_CONTROL_MODE in {"router", "auto"}:
-        try:
-            models = await asyncio.to_thread(_llama_router_list_models)
-            loaded = [m["id"] for m in models if (m.get("status") == "loaded")]
-            return {
-                "ok": True,
-                "source": "router",
-                "base_url": _llama_http_base_url(),
-                "current": get_current_model(),
-                "count": len(models),
-                "loaded": loaded,
-            }
-        except HTTPError as exc:
-            if LLAMA_CONTROL_MODE != "auto":
-                if getattr(exc, "code", None) == 404:
-                    return JSONResponse(
-                        content={
-                            "error": "llama_router_unavailable",
-                            "message": "llama-server /models endpoint returned 404. Start llama-server in router mode (no -m, with --models-dir).",
-                        },
-                        status_code=400,
-                    )
-                return JSONResponse(
-                    content={"error": "llama_router_http_error", "message": str(exc), "code": getattr(exc, "code", None)},
-                    status_code=500,
-                )
-        except URLError as exc:
-            if LLAMA_CONTROL_MODE != "auto":
-                return JSONResponse(content={"error": "llama_router_unreachable", "message": str(exc)}, status_code=500)
-        except Exception as exc:
-            if LLAMA_CONTROL_MODE != "auto":
-                return JSONResponse(content={"error": "llama_router_error", "message": str(exc)}, status_code=500)
-
-    # Legacy toolbox status.
     try:
-        result = await asyncio.to_thread(_run_llama_ctl, ["status", "--json"])
-        if result.returncode != 0:
-            msg = (result.stderr or result.stdout or "").strip()
-            return JSONResponse(content={"error": "llama_status_failed", "message": msg, "code": result.returncode}, status_code=500)
-        return JSONResponse(content=json.loads(result.stdout or "{}"))
+        models = await asyncio.to_thread(_llama_router_list_models)
+        loaded = [m["id"] for m in models if (m.get("status") == "loaded")]
+        return {
+            "ok": True,
+            "source": "router",
+            "base_url": _llama_http_base_url(),
+            "current": get_current_model(),
+            "count": len(models),
+            "loaded": loaded,
+        }
+    except HTTPError as exc:
+        if getattr(exc, "code", None) == 404:
+            return JSONResponse(
+                content={
+                    "error": "llama_router_unavailable",
+                    "message": "llama-server /models endpoint returned 404. Start llama-server in router mode (no -m, with --models-dir).",
+                },
+                status_code=400,
+            )
+        return JSONResponse(
+            content={"error": "llama_router_http_error", "message": str(exc), "code": getattr(exc, "code", None)},
+            status_code=500,
+        )
+    except URLError as exc:
+        return JSONResponse(content={"error": "llama_router_unreachable", "message": str(exc)}, status_code=500)
     except Exception as exc:
-        return JSONResponse(content={"error": "llama_status_error", "message": str(exc)}, status_code=500)
+        return JSONResponse(content={"error": "llama_router_error", "message": str(exc)}, status_code=500)
 
 
 @app.post("/admin/llama/eject")
 async def admin_llama_eject():
     # Router-mode eject: unload model(s) but keep server alive.
-    if LLAMA_CONTROL_MODE in {"router", "auto"}:
-        try:
-            models = await asyncio.to_thread(_llama_router_list_models)
-            loaded = [m["id"] for m in models if (m.get("status") == "loaded")]
-            unloaded: list[str] = []
-            for mid in loaded:
-                try:
-                    await asyncio.to_thread(_llama_router_unload_model, mid)
-                    unloaded.append(mid)
-                except Exception as exc:
-                    log_console(f"Unload failed for '{mid}': {exc}", "ERR")
-            return {"status": "ok", "source": "router", "loaded_before": loaded, "unloaded": unloaded}
-        except HTTPError as exc:
-            if LLAMA_CONTROL_MODE != "auto":
-                if getattr(exc, "code", None) == 404:
-                    return JSONResponse(
-                        content={
-                            "error": "llama_router_unavailable",
-                            "message": "llama-server /models endpoint returned 404. Start llama-server in router mode (no -m, with --models-dir).",
-                        },
-                        status_code=400,
-                    )
-                return JSONResponse(
-                    content={"error": "llama_router_http_error", "message": str(exc), "code": getattr(exc, "code", None)},
-                    status_code=500,
-                )
-        except URLError as exc:
-            if LLAMA_CONTROL_MODE != "auto":
-                return JSONResponse(content={"error": "llama_router_unreachable", "message": str(exc)}, status_code=500)
-        except Exception as exc:
-            if LLAMA_CONTROL_MODE != "auto":
-                return JSONResponse(content={"error": "llama_router_error", "message": str(exc)}, status_code=500)
-
-    # Legacy toolbox eject: stop the server process.
     try:
-        result = await asyncio.to_thread(_run_llama_ctl, ["stop"])
-        if result.returncode != 0:
-            msg = (result.stderr or result.stdout or "").strip()
-            return JSONResponse(content={"error": "llama_eject_failed", "message": msg, "code": result.returncode}, status_code=500)
-        return {"status": "ok", "source": "toolbox"}
+        models = await asyncio.to_thread(_llama_router_list_models)
+        loaded = [m["id"] for m in models if (m.get("status") == "loaded")]
+        unloaded: list[str] = []
+        for mid in loaded:
+            try:
+                await asyncio.to_thread(_llama_router_unload_model, mid)
+                unloaded.append(mid)
+            except Exception as exc:
+                log_console(f"Unload failed for '{mid}': {exc}", "ERR")
+        return {"status": "ok", "source": "router", "loaded_before": loaded, "unloaded": unloaded}
+    except HTTPError as exc:
+        if getattr(exc, "code", None) == 404:
+            return JSONResponse(
+                content={
+                    "error": "llama_router_unavailable",
+                    "message": "llama-server /models endpoint returned 404. Start llama-server in router mode (no -m, with --models-dir).",
+                },
+                status_code=400,
+            )
+        return JSONResponse(
+            content={"error": "llama_router_http_error", "message": str(exc), "code": getattr(exc, "code", None)},
+            status_code=500,
+        )
+    except URLError as exc:
+        return JSONResponse(content={"error": "llama_router_unreachable", "message": str(exc)}, status_code=500)
     except Exception as exc:
-        return JSONResponse(content={"error": "llama_eject_error", "message": str(exc)}, status_code=500)
+        return JSONResponse(content={"error": "llama_router_error", "message": str(exc)}, status_code=500)
 
 
 @app.post("/admin/llama/switch")
@@ -1110,67 +1020,44 @@ async def admin_llama_switch(payload: LlamaSwitchPayload):
     if not model_id:
         return JSONResponse(content={"error": "empty_model", "message": "model is required"}, status_code=400)
 
-    # Router-mode: set active model id and warm it (autoloads on llama-server).
-    if LLAMA_CONTROL_MODE in {"router", "auto"}:
-        try:
-            if LLAMA_SWITCH_EJECT_FIRST:
-                try:
-                    models = await asyncio.to_thread(_llama_router_list_models)
-                    loaded = [m["id"] for m in models if (m.get("status") == "loaded") and (m.get("id") != model_id)]
-                    for mid in loaded:
-                        await asyncio.to_thread(_llama_router_unload_model, mid)
-                except Exception:
-                    pass
-
-            set_current_model(model_id)
-            warmed = await asyncio.to_thread(warm_model, model_id)
-            if not warmed:
-                return JSONResponse(content={"error": "model_warmup_failed", "message": f"Failed to load model '{model_id}'."}, status_code=500)
-
-            models = await asyncio.to_thread(_llama_router_list_models)
-            loaded = [m["id"] for m in models if (m.get("status") == "loaded")]
-            return {"status": "ok", "source": "router", "active_model": model_id, "loaded": loaded}
-        except HTTPError as exc:
-            if LLAMA_CONTROL_MODE != "auto":
-                if getattr(exc, "code", None) == 404:
-                    return JSONResponse(
-                        content={
-                            "error": "llama_router_unavailable",
-                            "message": "llama-server /models endpoint returned 404. Start llama-server in router mode (no -m, with --models-dir).",
-                        },
-                        status_code=400,
-                    )
-                return JSONResponse(
-                    content={"error": "llama_router_http_error", "message": str(exc), "code": getattr(exc, "code", None)},
-                    status_code=500,
-                )
-        except URLError as exc:
-            if LLAMA_CONTROL_MODE != "auto":
-                return JSONResponse(content={"error": "llama_router_unreachable", "message": str(exc)}, status_code=500)
-        except Exception as exc:
-            if LLAMA_CONTROL_MODE != "auto":
-                return JSONResponse(content={"error": "llama_router_error", "message": str(exc)}, status_code=500)
-
-    # Legacy toolbox mode: restart server with explicit model file.
-    model_path = model_id
-    mmproj_path = (payload.mmproj or "").strip()
-    args = ["restart", "--model", model_path]
-    if mmproj_path:
-        args += ["--mmproj", mmproj_path]
-    else:
-        args += ["--no-mmproj"]
     try:
-        result = await asyncio.to_thread(_run_llama_ctl, args)
-        if result.returncode != 0:
-            msg = (result.stderr or result.stdout or "").strip()
-            return JSONResponse(content={"error": "llama_switch_failed", "message": msg, "code": result.returncode}, status_code=500)
-        models = await asyncio.to_thread(_wait_llama_ready, LLAMA_READY_TIMEOUT_S)
-        active = models[0] if models else get_current_model()
-        set_current_model(active)
-        await asyncio.to_thread(warm_model, active)
-        return {"status": "ok", "source": "toolbox", "active_model": active, "models": models}
+        if LLAMA_SWITCH_EJECT_FIRST:
+            try:
+                models = await asyncio.to_thread(_llama_router_list_models)
+                loaded = [m["id"] for m in models if (m.get("status") == "loaded") and (m.get("id") != model_id)]
+                for mid in loaded:
+                    await asyncio.to_thread(_llama_router_unload_model, mid)
+            except Exception:
+                pass
+
+        set_current_model(model_id)
+        warmed = await asyncio.to_thread(warm_model, model_id)
+        if not warmed:
+            return JSONResponse(
+                content={"error": "model_warmup_failed", "message": f"Failed to load model '{model_id}'."},
+                status_code=500,
+            )
+
+        models = await asyncio.to_thread(_llama_router_list_models)
+        loaded = [m["id"] for m in models if (m.get("status") == "loaded")]
+        return {"status": "ok", "source": "router", "active_model": model_id, "loaded": loaded}
+    except HTTPError as exc:
+        if getattr(exc, "code", None) == 404:
+            return JSONResponse(
+                content={
+                    "error": "llama_router_unavailable",
+                    "message": "llama-server /models endpoint returned 404. Start llama-server in router mode (no -m, with --models-dir).",
+                },
+                status_code=400,
+            )
+        return JSONResponse(
+            content={"error": "llama_router_http_error", "message": str(exc), "code": getattr(exc, "code", None)},
+            status_code=500,
+        )
+    except URLError as exc:
+        return JSONResponse(content={"error": "llama_router_unreachable", "message": str(exc)}, status_code=500)
     except Exception as exc:
-        return JSONResponse(content={"error": "llama_switch_error", "message": str(exc)}, status_code=500)
+        return JSONResponse(content={"error": "llama_router_error", "message": str(exc)}, status_code=500)
 
 
 @app.get("/models")
