@@ -219,6 +219,23 @@ This ensures that long-term memory only stores unique information, keeping retri
 **The Fix:** **Global Locking Strategy.**
 I introduced granular locks (`db_lock`, `METRICS_LOCK`, `self.lock`) wrapping every stateful operation. Specifically, SQLite operations are wrapped in `with db_lock:` to force serialization, preventing the dreaded "Database is locked" error during high-concurrency voice/text interleave.
 
+---
+
+## Android App (WIP)
+
+The Android replacement lives in `android/` and targets:
+- **TLS-only transport**: `https://<host>:8000` + `wss://<host>:8000/ws`
+- **TOFU certificate pinning**: the app prompts once to trust a server certificate (shows SHA-256 fingerprint), and prompts again if the certificate changes.
+
+### PCM16 Voice Streaming (Android)
+
+The WebSocket server (`/ws`) now supports an Android-friendly voice mode:
+- Client sends `AUDIO:PCM16LE:16000`
+- Client streams **raw PCM16LE mono @ 16kHz** as binary WS frames
+- Client sends `CMD:COMMIT_AUDIO` to finalize the utterance
+
+Browser clients remain on the default WebM/Opus mode (no changes required).
+
 ### Scenario 3: The "Silent Failure" of MP3 Conversion
 
 **The Risk:** The ESP32 client prefers MP3, but `pydub`/`ffmpeg` conversion can fail if system codecs are missing or the audio buffer is malformed.

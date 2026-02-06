@@ -942,9 +942,27 @@ async def websocket_endpoint(websocket: WebSocket):
     current_task = None
     stop_event = threading.Event()
     audio_buffer = io.BytesIO()
+    inbound_audio_mode = "webm"  # "webm" (browser MediaRecorder) | "pcm16le" (Android AudioRecord)
+    inbound_pcm_sr = SAMPLE_RATE
     recording_started_at = None
     recording_stopped_at = None
     first_partial_at = None
+
+    def _pcm16le_bytes_to_float32(pcm_bytes: bytes) -> np.ndarray | None:
+        if not pcm_bytes:
+            return None
+        if len(pcm_bytes) < 2:
+            return None
+        if len(pcm_bytes) % 2 == 1:
+            # Drop trailing byte; avoids np.frombuffer error.
+            pcm_bytes = pcm_bytes[:-1]
+        try:
+            audio_i16 = np.frombuffer(pcm_bytes, dtype="<i2")
+            if audio_i16.size == 0:
+                return None
+            return audio_i16.astype(np.float32) / 32768.0
+        except Exception:
+            return None
 
     def _mark_first_partial():
         nonlocal first_partial_at
@@ -986,6 +1004,36 @@ async def websocket_endpoint(websocket: WebSocket):
                         if current_task:
                             current_task.cancel()
                         continue
+                    if text_msg.startswith("AUDIO:"):
+                        # Client audio transport negotiation.
+                        # - "AUDIO:WEBM" (default): client streams MediaRecorder WebM/Opus chunks.
+                        # - "AUDIO:PCM16LE:16000": client streams raw PCM16LE mono @ 16kHz.
+                        try:
+                            parts = [p.strip() for p in text_msg.split(":") if p is not None]
+                            # parts[0] == "AUDIO"
+                            mode = parts[1].lower() if len(parts) > 1 else ""
+                            if mode in {"webm", "default"}:
+                                inbound_audio_mode = "webm"
+                                inbound_pcm_sr = SAMPLE_RATE
+                                await websocket.send_text("SYS:AUDIO:WEBM")
+                            elif mode in {"pcm16le", "pcm"}:
+                                sr = SAMPLE_RATE
+                                if len(parts) >= 3:
+                                    try:
+                                        sr = int(parts[2])
+                                    except Exception:
+                                        sr = SAMPLE_RATE
+                                if sr != SAMPLE_RATE:
+                                    await websocket.send_text(f"SYS:AUDIO:ERR: unsupported sample_rate {sr}; expected {SAMPLE_RATE}")
+                                else:
+                                    inbound_audio_mode = "pcm16le"
+                                    inbound_pcm_sr = sr
+                                    await websocket.send_text(f"SYS:AUDIO:PCM16LE:{sr}")
+                            else:
+                                await websocket.send_text(f"SYS:AUDIO:ERR: unknown mode '{mode}'")
+                        except Exception as e:
+                            await websocket.send_text(f"SYS:AUDIO:ERR: {e}")
+                        continue
                     if text_msg.startswith("SESSION:"):
                         try:
                             new_id = int(text_msg.split("SESSION:", 1)[1].strip())
@@ -1021,6 +1069,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         audio_bytes = audio_buffer.getvalue()
                         audio_buffer = io.BytesIO()
                         metrics = init_metrics("voice", current_session_id)
+                        metrics["audio_mode"] = inbound_audio_mode
                         metrics["record_start"] = recording_started_at
                         metrics["record_end"] = recording_stopped_at
                         metrics["first_partial"] = first_partial_at
@@ -1034,7 +1083,10 @@ async def websocket_endpoint(websocket: WebSocket):
                             continue
 
                         t_decode = time.time()
-                        audio_np = convert_webm_to_numpy(audio_bytes)
+                        if inbound_audio_mode == "pcm16le":
+                            audio_np = _pcm16le_bytes_to_float32(audio_bytes)
+                        else:
+                            audio_np = convert_webm_to_numpy(audio_bytes)
                         metrics["audio_decode"] = time.time() - t_decode
                         if audio_np is None:
                             finalize_metrics(metrics, "decode_failed")
@@ -1184,7 +1236,10 @@ async def websocket_endpoint(websocket: WebSocket):
                                 await live_stt.send_reset()
                         audio_buffer.write(data)
                         if live_stt:
-                            audio_np = convert_webm_to_numpy(data)
+                            if inbound_audio_mode == "pcm16le":
+                                audio_np = _pcm16le_bytes_to_float32(data)
+                            else:
+                                audio_np = convert_webm_to_numpy(data)
                             if audio_np is not None:
                                 live_stt.add_audio(audio_np)
 
