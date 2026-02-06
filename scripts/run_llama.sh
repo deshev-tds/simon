@@ -8,6 +8,15 @@ MODELS_DIR="${MODELS_DIR:-$HOME/models}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-1234}"
 
+# Server mode:
+# - "single": run llama-server with one explicit model (-m) (good for VL/mmproj selection)
+# - "router": run llama-server in multi-model mode (no -m) with HTTP model management (/models, /models/unload)
+SERVER_MODE="${SERVER_MODE:-single}" # single|router
+
+# Router mode controls
+MODELS_MAX="${MODELS_MAX:-1}"                 # number of models kept loaded (LRU)
+NO_MODELS_AUTOLOAD="${NO_MODELS_AUTOLOAD:-off}" # on|off
+
 CTX="${CTX:-131072}"
 NGL="${NGL:-999}"
 FA="${FA:-on}"
@@ -199,7 +208,13 @@ show_status() {
     model="$(cat "$MODEL_FILE" 2>/dev/null || echo "unknown")"
     echo "RUNNING"
     echo "  PID:   $pid"
-    echo "  MODEL: $model"
+    echo "  MODE:  $SERVER_MODE"
+    if [[ "$SERVER_MODE" == "router" ]]; then
+      echo "  MODELS_DIR: $MODELS_DIR"
+      echo "  MODELS_MAX: $MODELS_MAX"
+    else
+      echo "  MODEL: $model"
+    fi
     echo "  HOST:  $HOST"
     echo "  PORT:  $PORT"
     echo "  LOG:   $LOG_FILE"
@@ -221,8 +236,11 @@ show_status_json() {
   printf '{'
   printf '"running":%s,' "$running"
   printf '"pid":"%s",' "$(json_escape "$pid")"
+  printf '"server_mode":"%s",' "$(json_escape "$SERVER_MODE")"
   printf '"model_path":"%s",' "$(json_escape "$model")"
   printf '"models_dir":"%s",' "$(json_escape "$MODELS_DIR")"
+  printf '"models_max":%s,' "$(json_escape "$MODELS_MAX")"
+  printf '"no_models_autoload":"%s",' "$(json_escape "$NO_MODELS_AUTOLOAD")"
   printf '"host":"%s",' "$(json_escape "$HOST")"
   printf '"port":%s,' "$(json_escape "$PORT")"
   printf '"log_file":"%s",' "$(json_escape "$LOG_FILE")"
@@ -299,13 +317,20 @@ build_cmd() {
     --cache-type-k "$CACHE_K"
     --cache-type-v "$CACHE_V"
     "$perf_flag"
-    -m "$MODEL_PATH"
     --host "$HOST"
     --port "$PORT"
   )
 
-  if [[ -n "${MMPROJ_PATH:-}" ]]; then
-    CMD+=(--mmproj "$MMPROJ_PATH")
+  if [[ "$SERVER_MODE" == "router" ]]; then
+    CMD+=(--models-dir "$MODELS_DIR" --models-max "$MODELS_MAX")
+    if [[ "$NO_MODELS_AUTOLOAD" == "on" ]]; then
+      CMD+=(--no-models-autoload)
+    fi
+  else
+    CMD+=(-m "$MODEL_PATH")
+    if [[ -n "${MMPROJ_PATH:-}" ]]; then
+      CMD+=(--mmproj "$MMPROJ_PATH")
+    fi
   fi
 
   # Prompt cache controls
@@ -347,8 +372,26 @@ start_server() {
   fi
 
   local model_arg="" index_arg="" mmproj_arg="" no_mmproj=0
+  local server_mode_override=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --router)
+        server_mode_override="router"
+        shift
+        ;;
+      --single)
+        server_mode_override="single"
+        shift
+        ;;
+      --models-max)
+        [[ $# -ge 2 ]] || die "--models-max requires a number"
+        MODELS_MAX="$2"
+        shift 2
+        ;;
+      --no-models-autoload)
+        NO_MODELS_AUTOLOAD="on"
+        shift
+        ;;
       --model)
         [[ $# -ge 2 ]] || die "--model requires a path"
         model_arg="$2"
@@ -374,22 +417,35 @@ start_server() {
     esac
   done
 
-  MMPROJ_PATH=""
-  if [[ -n "$model_arg" ]]; then
-    set_selected_model "$model_arg"
-  elif [[ -n "$index_arg" ]]; then
-    [[ "$index_arg" =~ ^[0-9]+$ ]] || die "--index must be a number"
-    load_models
-    ((index_arg >= 1 && index_arg <= ${#MODELS[@]})) || die "--index out of range (1-${#MODELS[@]})"
-    set_selected_model "${MODELS[$((index_arg-1))]}"
-  else
-    pick_model
+  if [[ -n "$server_mode_override" ]]; then
+    SERVER_MODE="$server_mode_override"
   fi
 
-  if [[ "$no_mmproj" -eq 1 ]]; then
+  if [[ "$SERVER_MODE" == "router" ]]; then
+    if [[ -n "$model_arg" || -n "$index_arg" || -n "$mmproj_arg" || "$no_mmproj" -eq 1 ]]; then
+      die "Router mode does not accept --model/--index/--mmproj/--no-mmproj. Use HTTP model management."
+    fi
+    MODEL_PATH=""
     MMPROJ_PATH=""
-  elif [[ -n "$mmproj_arg" ]]; then
-    set_selected_mmproj "$mmproj_arg"
+    printf "%s" "<router>" > "$MODEL_FILE"
+  else
+    MMPROJ_PATH=""
+    if [[ -n "$model_arg" ]]; then
+      set_selected_model "$model_arg"
+    elif [[ -n "$index_arg" ]]; then
+      [[ "$index_arg" =~ ^[0-9]+$ ]] || die "--index must be a number"
+      load_models
+      ((index_arg >= 1 && index_arg <= ${#MODELS[@]})) || die "--index out of range (1-${#MODELS[@]})"
+      set_selected_model "${MODELS[$((index_arg-1))]}"
+    else
+      pick_model
+    fi
+
+    if [[ "$no_mmproj" -eq 1 ]]; then
+      MMPROJ_PATH=""
+    elif [[ -n "$mmproj_arg" ]]; then
+      set_selected_mmproj "$mmproj_arg"
+    fi
   fi
 
   build_cmd
@@ -493,13 +549,21 @@ usage() {
   cat <<'EOF'
 Usage:
   run_llama.sh                 # interactive menu
-  run_llama.sh start [--model PATH | --index N] [--mmproj PATH | --no-mmproj]
+  run_llama.sh start [--router [--models-max N] [--no-models-autoload] | --single] [--model PATH | --index N] [--mmproj PATH | --no-mmproj]
   run_llama.sh stop            # stop server (eject/free VRAM)
   run_llama.sh eject           # alias for stop
-  run_llama.sh restart [--model PATH | --index N] [--mmproj PATH | --no-mmproj]
+  run_llama.sh restart [--router [--models-max N] [--no-models-autoload] | --single] [--model PATH | --index N] [--mmproj PATH | --no-mmproj]
   run_llama.sh status [--json]
   run_llama.sh list [--json]
   run_llama.sh logs
+
+Router mode notes:
+  - Start with: SERVER_MODE=router MODELS_MAX=1 run_llama.sh start --router
+  - Model management happens over HTTP:
+      GET  http://HOST:PORT/models
+      POST http://HOST:PORT/models/unload {"model":"<id>"}
+  - For multimodal models in --models-dir:
+      Put model + mmproj into a subdirectory and name the projector file starting with "mmproj".
 EOF
 }
 
