@@ -45,6 +45,9 @@ STREAM_FLUSH_SECS = 0.05
 EXPLICIT_MEMORY_MAX_CHARS = 400
 SESSION_TITLE_MAX_CHARS = 80
 SESSION_TITLE_CONTEXT_MAX_CHARS = 800
+TOOL_LOOP_MAX_TOKENS = 256
+FILE_EVIDENCE_MAX_DOCS = 8
+FILE_EVIDENCE_FALLBACK_CHUNKS_PER_FILE = 3
 
 _UNCERTAIN_PHRASES = (
     "not sure",
@@ -78,6 +81,7 @@ _PERSON_STOPWORDS = {
 _TITLE_PATTERN = re.compile(r"^(?:Mr\.|Ms\.|Mrs\.|Dr\.)\s+", re.I)
 _PERSON_PATTERN = re.compile(r"\b(?:Mr\.|Ms\.|Mrs\.|Dr\.)?\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b")
 _CITY_PATTERN = re.compile(r"\b(?:in|at|from|near|to)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b")
+_UPLOAD_SOURCE_PATTERN = re.compile(r"^upload:([^:]+):")
 
 _DEEP_SYSTEM_PROMPT = (
     "You are Simon (Deep Mode). You MUST call search_memory before answering. "
@@ -230,10 +234,10 @@ def _stream_sse_chat(url: str, payload: dict, on_token, stop_evt: threading.Even
     return saw_delta
 
 
-def _parse_evidence_json(text: str) -> dict | None:
+def _parse_prefixed_json(text: str, prefix: str) -> dict | None:
     for line in str(text).splitlines():
-        if line.startswith("EVIDENCE_JSON:"):
-            payload_str = line.split("EVIDENCE_JSON:", 1)[1].strip()
+        if line.startswith(prefix):
+            payload_str = line.split(prefix, 1)[1].strip()
             if not payload_str:
                 return None
             try:
@@ -241,6 +245,14 @@ def _parse_evidence_json(text: str) -> dict | None:
             except Exception:
                 return None
     return None
+
+
+def _parse_evidence_json(text: str) -> dict | None:
+    return _parse_prefixed_json(text, "EVIDENCE_JSON:")
+
+
+def _parse_doc_json(text: str) -> dict | None:
+    return _parse_prefixed_json(text, "DOC_JSON:")
 
 
 def _evidence_items_to_lines(items: list[dict]) -> list[str]:
@@ -285,6 +297,30 @@ def _extract_evidence_items(tool_texts: list[str]) -> tuple[list[dict], list[str
                 lines.extend([l for l in payload_lines if isinstance(l, str)])
             if payload_items and not payload_lines:
                 lines.extend(_evidence_items_to_lines(payload_items))
+            continue
+        doc_payload = _parse_doc_json(text)
+        if doc_payload:
+            content = str(doc_payload.get("content") or "").replace("\n", " ").strip()
+            source = str(doc_payload.get("source") or "corpus")
+            ts = 0
+            created_at = doc_payload.get("created_at")
+            if created_at is not None:
+                try:
+                    ts = int(float(created_at) * 1000)
+                except (TypeError, ValueError):
+                    ts = 0
+            if content:
+                doc_item = {
+                    "source_type": "corpus",
+                    "doc_id": doc_payload.get("id"),
+                    "ts": ts,
+                    "text": content[:200],
+                    "score": None,
+                    "distance": None,
+                    "source": source,
+                }
+                items.append(doc_item)
+                lines.append(f"[CORPUS] ({source}, ts={ts or '?'}) : {content[:150]}...")
             continue
         for line in str(text).splitlines():
             line = line.strip()
@@ -431,7 +467,151 @@ def _enforce_evidence_answer(user_text: str, evidence_items: list[dict]) -> tupl
     return "not found", "forced_not_found"
 
 
-def _force_tool_call(user_text: str, session_id: int, memory, metrics: dict):
+def _extract_upload_file_id(source: str) -> str | None:
+    m = _UPLOAD_SOURCE_PATTERN.match(str(source or ""))
+    if not m:
+        return None
+    return m.group(1)
+
+
+def _force_file_tool_call(
+    user_text: str,
+    session_id: int,
+    file_payloads: list[dict] | None,
+    metrics: dict,
+):
+    if not file_payloads:
+        return None
+
+    file_map: dict[str, str] = {}
+    for f in file_payloads:
+        if not isinstance(f, dict):
+            continue
+        fid = str(f.get("id") or "").strip()
+        if not fid:
+            continue
+        fname = str(f.get("filename") or f"file-{fid[:8]}").strip()
+        file_map[fid] = fname
+    if not file_map:
+        return None
+
+    items: list[dict] = []
+
+    def _append_item(doc_id, source, content, created_at, score=None):
+        fid = _extract_upload_file_id(source)
+        if not fid or fid not in file_map:
+            return
+        text = str(content or "").replace("\n", " ").strip()
+        if not text:
+            return
+        ts = 0
+        if created_at is not None:
+            try:
+                ts = int(float(created_at) * 1000)
+            except (TypeError, ValueError):
+                ts = 0
+        items.append({
+            "source_type": "corpus",
+            "doc_id": doc_id,
+            "ts": ts,
+            "text": text[:200],
+            "score": score,
+            "distance": None,
+            "source": source,
+            "file_id": fid,
+            "filename": file_map.get(fid),
+        })
+
+    try:
+        if db.corpus_conn is None:
+            return None
+
+        query = (user_text or "").strip()
+        if query:
+            hits = db.fts_recursive_search_corpus(
+                query,
+                limit=max(16, len(file_map) * 4),
+                conn=db.corpus_conn,
+                lock=db.db_lock,
+            )
+            for h in hits:
+                source = h.get("source") or ""
+                if _extract_upload_file_id(source) not in file_map:
+                    continue
+                _append_item(
+                    h.get("doc_id") or h.get("id"),
+                    source,
+                    h.get("content"),
+                    h.get("created_at"),
+                    h.get("score"),
+                )
+                if len(items) >= FILE_EVIDENCE_MAX_DOCS:
+                    break
+
+        if not items:
+            with db.db_lock:
+                for fid in file_map:
+                    rows = db.corpus_conn.execute(
+                        "SELECT id, source, content, created_at FROM documents WHERE source LIKE ? ORDER BY id ASC LIMIT ?",
+                        (f"upload:{fid}:%", FILE_EVIDENCE_FALLBACK_CHUNKS_PER_FILE),
+                    ).fetchall()
+                    for row in rows:
+                        _append_item(row[0], row[1], row[2], row[3], None)
+                        if len(items) >= FILE_EVIDENCE_MAX_DOCS:
+                            break
+                    if len(items) >= FILE_EVIDENCE_MAX_DOCS:
+                        break
+    except Exception as exc:
+        if RLM_TRACE and not QUIET_LOGS:
+            print(f"[TRACE][file_seed] failed: {exc}")
+        return None
+
+    if not items:
+        metrics.setdefault("file_seed", {})
+        metrics["file_seed"] = {
+            "ok": False,
+            "files": list(file_map.keys()),
+            "reason": "no_indexed_chunks",
+        }
+        return None
+
+    lines = []
+    for item in items[:FILE_EVIDENCE_MAX_DOCS]:
+        ts = item.get("ts")
+        ts_label = f"ts={ts}" if ts else "ts=?"
+        fname = item.get("filename") or item.get("file_id") or "file"
+        text = (item.get("text") or "").strip()
+        lines.append(f"[CORPUS] (file={fname}, {ts_label}): {text[:150]}...")
+
+    payload = {"items": items[:FILE_EVIDENCE_MAX_DOCS], "lines": lines}
+    out = f"EVIDENCE_JSON: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}"
+    if lines:
+        out += "\n" + "\n".join(lines)
+    if len(out) > MAX_TOOL_OUTPUT_CHARS:
+        out = out[:MAX_TOOL_OUTPUT_CHARS] + "...[TRUNCATED]"
+
+    metrics.setdefault("file_seed", {})
+    metrics["file_seed"] = {
+        "ok": True,
+        "files": list(file_map.keys()),
+        "items": len(items[:FILE_EVIDENCE_MAX_DOCS]),
+    }
+    return out
+
+
+def _force_tool_call(
+    user_text: str,
+    session_id: int,
+    memory,
+    metrics: dict,
+    file_payloads: list[dict] | None = None,
+):
+    file_seed = _force_file_tool_call(user_text, session_id, file_payloads, metrics)
+    if file_seed:
+        metrics.setdefault("rlm_forced_tool", [])
+        metrics["rlm_forced_tool"].append({"query": "__attached_files__", "mode": "files"})
+        return file_seed
+
     query = user_text or ""
     result = tools.tool_search_memory(
         query,
@@ -1075,7 +1255,31 @@ async def process_and_stream_response(
         auto_hop_used = False
         tool_calls_made = False
         all_tool_texts = []
-        while turn_count < AGENT_MAX_TURNS and not stop_evt.is_set():
+        skip_tool_loop = False
+        if file_payloads:
+            seeded = _force_file_tool_call(user_text, session_id, file_payloads, metrics)
+            if seeded:
+                tool_calls_made = True
+                seeded = seeded[:MAX_TOOL_OUTPUT_CHARS]
+                all_tool_texts.append(seeded)
+                tool_chars_used += len(seeded)
+                deep_messages.append({
+                    "role": "tool",
+                    "tool_call_id": "attached-files-seed",
+                    "content": seeded,
+                })
+                seed_ok, _, _, _, _ = _evidence_check(user_text, [seeded])
+                skip_tool_loop = seed_ok
+                if not stop_evt.is_set():
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            websocket.send_text("SYS:THINKING: Reading attached files..."),
+                            loop,
+                        )
+                    except Exception:
+                        pass
+
+        while (not skip_tool_loop) and turn_count < AGENT_MAX_TURNS and not stop_evt.is_set():
             if not _tool_calling_enabled():
                 break
             turn_count += 1
@@ -1087,6 +1291,7 @@ async def process_and_stream_response(
                     stream=False,
                     tools=tools.SIMON_TOOLS,
                     tool_choice="auto",
+                    max_tokens=TOOL_LOOP_MAX_TOKENS,
                 )
             except Exception as exc:
                 disabled = _maybe_disable_tool_calling(exc)
@@ -1213,7 +1418,13 @@ async def process_and_stream_response(
                         )
                     except Exception:
                         pass
-                forced = _force_tool_call(user_text, session_id, memory, metrics)
+                forced = _force_tool_call(
+                    user_text,
+                    session_id,
+                    memory,
+                    metrics,
+                    file_payloads=file_payloads,
+                )
                 tool_calls_made = True
                 forced_text = str(forced)
                 all_tool_texts.append(forced_text)
@@ -1368,7 +1579,26 @@ async def process_and_stream_response(
                 auto_hop_used = False
                 tool_calls_made = False
                 all_tool_texts = []
-                while turn_count < AGENT_MAX_TURNS and not stop_evt.is_set():
+                skip_tool_loop = False
+                if file_payloads:
+                    seeded = _force_file_tool_call(user_text, session_id, file_payloads, metrics)
+                    if seeded:
+                        tool_calls_made = True
+                        seeded = seeded[:MAX_TOOL_OUTPUT_CHARS]
+                        all_tool_texts.append(seeded)
+                        tool_chars_used += len(seeded)
+                        current_messages.append({
+                            "role": "tool",
+                            "tool_call_id": "attached-files-seed",
+                            "content": seeded,
+                        })
+                        seed_ok, _, _, _, _ = _evidence_check(user_text, [seeded])
+                        skip_tool_loop = seed_ok
+                        asyncio.run_coroutine_threadsafe(
+                            websocket.send_text("SYS:THINKING: Reading attached files..."),
+                            loop,
+                        )
+                while (not skip_tool_loop) and turn_count < AGENT_MAX_TURNS and not stop_evt.is_set():
                     if not _tool_calling_enabled():
                         break
                     turn_count += 1
@@ -1380,7 +1610,8 @@ async def process_and_stream_response(
                             temperature=0.7,
                             stream=False,
                             tools=tools_list,
-                            tool_choice="auto"
+                            tool_choice="auto",
+                            max_tokens=TOOL_LOOP_MAX_TOKENS,
                         )
                     except Exception as e:
                         disabled = _maybe_disable_tool_calling(e)
@@ -1502,7 +1733,13 @@ async def process_and_stream_response(
                                 websocket.send_text("SYS:THINKING: Consulting memory..."),
                                 loop,
                             )
-                            forced = _force_tool_call(user_text, session_id, memory, metrics)
+                            forced = _force_tool_call(
+                                user_text,
+                                session_id,
+                                memory,
+                                metrics,
+                                file_payloads=file_payloads,
+                            )
                             tool_calls_made = True
                             forced_text = str(forced)
                             all_tool_texts.append(forced_text)

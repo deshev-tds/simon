@@ -155,6 +155,13 @@ def tool_search_memory(
                 conn=db.corpus_conn,
                 lock=lock,
             )
+            if not corpus_res:
+                corpus_res = db.fts_recursive_search_corpus(
+                    f"session {int(session_id)}",
+                    limit=3,
+                    conn=db.corpus_conn,
+                    lock=lock,
+                )
     elif scope == "recent":
         fts_res = db.fts_recursive_search(
             query,
