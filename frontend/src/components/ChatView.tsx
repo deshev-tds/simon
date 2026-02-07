@@ -36,7 +36,38 @@ const ChatView: React.FC<ChatViewProps> = ({ status, messages, onSendMessage, on
 
   const MAX_IMAGES = 10;
   const MAX_IMAGE_MB = 8;
-  const MAX_IMAGE_EDGE = 1024;
+  // Note: This is the processed image that is both:
+  // 1) rendered in the chat history, and
+  // 2) sent to the backend/model.
+  //
+  // The previous 1024px + JPEG-only pipeline was noticeably lossy for screenshots/text.
+  // We keep images under the same size cap, but preserve PNG when possible and otherwise
+  // search for the best JPEG quality that fits.
+  const MAX_IMAGE_EDGE = 1536;
+  const MIN_IMAGE_EDGE = 320;
+
+  const approxB64Bytes = (b64: string) => Math.floor((b64.length * 3) / 4);
+
+  const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(max, n));
+
+  const renderScaled = (img: HTMLImageElement, targetMaxEdge: number) => {
+    const maxEdge = Math.max(img.width, img.height);
+    const edge = Math.max(1, Math.round(targetMaxEdge));
+    const scale = maxEdge > edge ? edge / maxEdge : 1;
+    const width = Math.max(1, Math.round(img.width * scale));
+    const height = Math.max(1, Math.round(img.height * scale));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
+    ctx.imageSmoothingEnabled = true;
+    // @ts-ignore: imageSmoothingQuality exists in all modern browsers we target.
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(img, 0, 0, width, height);
+    return { canvas, width, height };
+  };
 
   // 1. SCROLL STATE TRACKING
   const handleScroll = () => {
@@ -85,34 +116,93 @@ const ChatView: React.FC<ChatViewProps> = ({ status, messages, onSendMessage, on
       };
     });
 
+    const sizeLimitBytes = MAX_IMAGE_MB * 1024 * 1024;
+    const preferPng = file.type === 'image/png';
+
     const maxEdge = Math.max(img.width, img.height);
-    const scale = maxEdge > MAX_IMAGE_EDGE ? MAX_IMAGE_EDGE / maxEdge : 1;
-    const width = Math.max(1, Math.round(img.width * scale));
-    const height = Math.max(1, Math.round(img.height * scale));
-
-    const canvas = document.createElement('canvas');
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) {
-      setImageError('Failed to process image.');
-      return null;
-    }
-    ctx.drawImage(img, 0, 0, width, height);
-
-    const mime = 'image/jpeg';
-    let dataUrl = canvas.toDataURL(mime, 0.85);
-    let base64 = dataUrl.split(',')[1] || '';
-    let sizeBytes = Math.floor((base64.length * 3) / 4);
-
-    if (sizeBytes > MAX_IMAGE_MB * 1024 * 1024) {
-      dataUrl = canvas.toDataURL(mime, 0.7);
-      base64 = dataUrl.split(',')[1] || '';
-      sizeBytes = Math.floor((base64.length * 3) / 4);
+    const startEdge = Math.min(MAX_IMAGE_EDGE, maxEdge);
+    const edgeAttempts: number[] = [];
+    let edge = startEdge;
+    while (edgeAttempts.length < 6) {
+      edgeAttempts.push(Math.max(MIN_IMAGE_EDGE, Math.round(edge)));
+      if (edge <= MIN_IMAGE_EDGE) break;
+      edge = Math.max(MIN_IMAGE_EDGE, Math.round(edge * 0.85));
+      if (edgeAttempts.includes(edge)) break;
     }
 
-    if (sizeBytes > MAX_IMAGE_MB * 1024 * 1024) {
-      setImageError('Image too large after compression.');
+    let mime: string | null = null;
+    let base64: string | null = null;
+    let sizeBytes: number | null = null;
+    let width: number | null = null;
+    let height: number | null = null;
+
+    for (const attemptEdge of edgeAttempts) {
+      const rendered = renderScaled(img, attemptEdge);
+      if (!rendered) {
+        setImageError('Failed to process image.');
+        return null;
+      }
+
+      // Prefer preserving PNG for screenshots/text if it fits in the size budget.
+      if (preferPng) {
+        const dataUrlPng = rendered.canvas.toDataURL('image/png');
+        const b64Png = dataUrlPng.split(',')[1] || '';
+        const bytesPng = approxB64Bytes(b64Png);
+        if (bytesPng <= sizeLimitBytes) {
+          mime = 'image/png';
+          base64 = b64Png;
+          sizeBytes = bytesPng;
+          width = rendered.width;
+          height = rendered.height;
+          break;
+        }
+      }
+
+      // Otherwise use JPEG and pick the highest quality that fits.
+      const maxQ = 0.92;
+      const minQ = 0.5;
+      const dataUrlMax = rendered.canvas.toDataURL('image/jpeg', maxQ);
+      const b64Max = dataUrlMax.split(',')[1] || '';
+      const bytesMax = approxB64Bytes(b64Max);
+      if (bytesMax <= sizeLimitBytes) {
+        mime = 'image/jpeg';
+        base64 = b64Max;
+        sizeBytes = bytesMax;
+        width = rendered.width;
+        height = rendered.height;
+        break;
+      }
+
+      // Binary search the best JPEG quality that fits.
+      let lo = minQ;
+      let hi = maxQ;
+      let bestB64 = '';
+      let bestBytes = 0;
+      for (let i = 0; i < 7; i++) {
+        const q = clamp((lo + hi) / 2, minQ, maxQ);
+        const dataUrlMid = rendered.canvas.toDataURL('image/jpeg', q);
+        const b64Mid = dataUrlMid.split(',')[1] || '';
+        const bytesMid = approxB64Bytes(b64Mid);
+        if (bytesMid <= sizeLimitBytes) {
+          bestB64 = b64Mid;
+          bestBytes = bytesMid;
+          lo = q; // try higher quality
+        } else {
+          hi = q; // need lower quality
+        }
+      }
+      if (bestBytes > 0 && bestBytes <= sizeLimitBytes) {
+        mime = 'image/jpeg';
+        base64 = bestB64;
+        sizeBytes = bestBytes;
+        width = rendered.width;
+        height = rendered.height;
+        break;
+      }
+    }
+
+    if (!mime || !base64 || !sizeBytes || !width || !height) {
+      setImageError(`Image too large after compression. (limit: ${MAX_IMAGE_MB}MB)`);
       return null;
     }
 
