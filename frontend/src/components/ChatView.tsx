@@ -296,7 +296,8 @@ const ChatView: React.FC<ChatViewProps> = ({ status, messages, onSendMessage, on
           const meta = await onUploadFile(file);
           if (meta?.id) uploaded.push(meta);
         } catch (err) {
-          setFileError(`Upload failed: ${file.name}`);
+          const msg = err instanceof Error ? err.message : String(err);
+          setFileError(`Upload failed: ${file.name} (${msg})`);
         }
       }
     } finally {

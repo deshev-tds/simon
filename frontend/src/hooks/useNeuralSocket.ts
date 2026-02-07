@@ -20,6 +20,9 @@ const getApiCandidates = () => {
   const isSecurePage = window.location.protocol === 'https:';
   const primaryProto = isSecurePage ? 'https' : 'http';
   const primary = `${primaryProto}://${host}:${DEFAULT_API_PORT}`;
+  if (isSecurePage) {
+    return [primary];
+  }
   const alt = `${primaryProto === 'https' ? 'http' : 'https'}://${host}:${DEFAULT_API_PORT}`;
   return [primary, alt];
 };
@@ -68,7 +71,20 @@ export const useNeuralSocket = () => {
           apiBaseRef.current = base;
           return res;
         }
-        lastError = new Error(`API ${res.status} ${res.statusText}`);
+        // Server responded. Treat as a real API error (do not fail over protocols/hosts).
+        let detail = '';
+        try {
+          const ctype = res.headers.get('content-type') || '';
+          if (ctype.includes('application/json')) {
+            const payload = await res.clone().json();
+            detail = String(payload?.message || payload?.error || '');
+          } else {
+            detail = (await res.clone().text()).slice(0, 300);
+          }
+        } catch {
+          detail = '';
+        }
+        throw new Error(`API ${res.status} ${res.statusText}${detail ? `: ${detail}` : ''}`);
       } catch (err) {
         lastError = err;
       }

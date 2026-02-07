@@ -88,6 +88,23 @@ _DEEP_SYSTEM_PROMPT = (
     "Do not hallucinate."
 )
 
+_TOOL_CALLING_SUPPORTED: bool | None = None
+
+
+def _tool_calling_enabled() -> bool:
+    return _TOOL_CALLING_SUPPORTED is not False
+
+
+def _maybe_disable_tool_calling(exc: Exception) -> bool:
+    global _TOOL_CALLING_SUPPORTED
+    text = str(exc or "").lower()
+    looks_bad_request = ("400" in text) or ("badrequest" in text) or ("invalid_request" in text)
+    looks_tools_related = ("tool" in text) or ("function" in text) or ("tool_choice" in text) or ("tools" in text)
+    if looks_bad_request and looks_tools_related:
+        _TOOL_CALLING_SUPPORTED = False
+        return True
+    return False
+
 
 def _with_system_prompt(messages: list[dict]) -> list[dict]:
     if not SYSTEM_PROMPT:
@@ -1059,6 +1076,8 @@ async def process_and_stream_response(
         tool_calls_made = False
         all_tool_texts = []
         while turn_count < AGENT_MAX_TURNS and not stop_evt.is_set():
+            if not _tool_calling_enabled():
+                break
             turn_count += 1
             try:
                 response = client.chat.completions.create(
@@ -1070,8 +1089,12 @@ async def process_and_stream_response(
                     tool_choice="auto",
                 )
             except Exception as exc:
+                disabled = _maybe_disable_tool_calling(exc)
                 if DEBUG_MODE:
-                    log_console(f"Agent Loop Error: {exc}", "ERR")
+                    if disabled:
+                        log_console(f"Agent Loop: disabling tools for provider compatibility ({exc})", "WARN")
+                    else:
+                        log_console(f"Agent Loop Error: {exc}", "ERR")
                 break
 
             msg_dict = _msg_to_dict(response.choices[0].message)
@@ -1346,6 +1369,8 @@ async def process_and_stream_response(
                 tool_calls_made = False
                 all_tool_texts = []
                 while turn_count < AGENT_MAX_TURNS and not stop_evt.is_set():
+                    if not _tool_calling_enabled():
+                        break
                     turn_count += 1
 
                     try:
@@ -1358,7 +1383,11 @@ async def process_and_stream_response(
                             tool_choice="auto"
                         )
                     except Exception as e:
-                        print(f"Agent Loop Error: {e}")
+                        disabled = _maybe_disable_tool_calling(e)
+                        if disabled:
+                            log_console(f"Agent Loop: disabling tools for provider compatibility ({e})", "WARN")
+                        else:
+                            print(f"Agent Loop Error: {e}")
                         break
 
                     msg_dict = _msg_to_dict(response.choices[0].message)
