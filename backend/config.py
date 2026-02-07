@@ -96,6 +96,15 @@ MAX_IMAGE_EDGE = _get_int_env("SIMON_MAX_IMAGE_EDGE", 1024)
 IMAGE_DIR = DATA_DIR / "images"
 IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 
+# File uploads (attachments)
+MAX_FILES_PER_MESSAGE = _get_int_env("SIMON_MAX_FILES_PER_MESSAGE", 5)
+MAX_FILE_MB = _get_float_env("SIMON_MAX_FILE_MB", 10.0)
+MAX_FILE_INLINE_CHARS = _get_int_env("SIMON_MAX_FILE_INLINE_CHARS", 6000)
+CORPUS_CHUNK_CHARS = _get_int_env("SIMON_CORPUS_CHUNK_CHARS", 1800)
+CORPUS_CHUNK_OVERLAP = _get_int_env("SIMON_CORPUS_CHUNK_OVERLAP", 200)
+FILE_DIR = DATA_DIR / "files"
+FILE_DIR.mkdir(parents=True, exist_ok=True)
+
 MEM_SEED_LIMIT = _get_int_env("SIMON_MEM_SEED_LIMIT", 50000)
 MEM_MAX_ROWS = _get_int_env("SIMON_MEM_MAX_ROWS", MEM_SEED_LIMIT)
 MEM_PRUNE_INTERVAL_S = _get_int_env("SIMON_MEM_PRUNE_INTERVAL_S", 60)

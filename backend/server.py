@@ -17,6 +17,7 @@ import uuid
 import json
 import shutil
 import tempfile
+import hashlib
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from urllib.request import Request as _UrlRequest, urlopen
@@ -397,6 +398,36 @@ def _normalize_image_payloads(images) -> list[dict]:
     return normalized
 
 
+def _normalize_file_payloads(files, session_id: int | None = None) -> list[dict]:
+    if not files:
+        return []
+    if len(files) > MAX_FILES_PER_MESSAGE:
+        raise ValueError(f"Too many files (max {MAX_FILES_PER_MESSAGE}).")
+    normalized = []
+    for idx, f in enumerate(files):
+        fid = None
+        if isinstance(f, str):
+            fid = f
+        elif isinstance(f, dict):
+            fid = f.get("id") or f.get("file_id")
+        if not fid:
+            raise ValueError("Invalid file payload.")
+        fid = str(fid).strip()
+        meta = db.get_uploaded_file(fid, conn=db_conn, lock=db_lock)
+        if not meta:
+            raise ValueError(f"File not found: {fid}")
+        if session_id is not None and int(meta.get("session_id") or 0) != int(session_id):
+            raise ValueError("File does not belong to this session.")
+        normalized.append({
+            "id": meta.get("id") or fid,
+            "filename": meta.get("filename") or f"file-{idx}",
+            "mime": meta.get("mime") or "application/octet-stream",
+            "size_bytes": int(meta.get("size_bytes") or 0),
+            "sha256": meta.get("sha256") or "",
+        })
+    return normalized
+
+
 def _build_vision_content(prompt: str, images: list[dict]):
     parts = []
     if prompt:
@@ -567,6 +598,179 @@ async def vision_chat_endpoint(request: Request):
     except Exception as e:
         log_console(f"Vision chat failed: {e}", "ERR")
         return JSONResponse(content={"error": "vision_chat_failed", "message": str(e)}, status_code=500)
+
+
+def _safe_filename(name: str) -> str:
+    base = os.path.basename(name or "").strip()
+    if not base:
+        return "upload.bin"
+    # Keep it simple and filesystem-safe.
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_", base)
+    base = base.strip("._")
+    return base or "upload.bin"
+
+
+def _chunk_text(text: str, chunk_chars: int, overlap: int) -> list[str]:
+    text = text or ""
+    chunk_chars = max(200, int(chunk_chars or 0))
+    overlap = max(0, int(overlap or 0))
+    if not text:
+        return []
+    if len(text) <= chunk_chars:
+        return [text]
+    out = []
+    i = 0
+    step = max(1, chunk_chars - overlap)
+    while i < len(text):
+        out.append(text[i:i + chunk_chars])
+        i += step
+        if len(out) > 2000:
+            # Hard safety cap.
+            break
+    return out
+
+
+def _index_file_into_corpus(
+    *,
+    file_id: str,
+    session_id: int,
+    filename: str,
+    mime: str,
+    text: str,
+):
+    if not text:
+        return {"indexed": False, "chunks": 0}
+
+    chunks = _chunk_text(text, CORPUS_CHUNK_CHARS, CORPUS_CHUNK_OVERLAP)
+    if not chunks:
+        return {"indexed": False, "chunks": 0}
+
+    created_at = time.time()
+    rows = []
+    total = len(chunks)
+    for idx, chunk in enumerate(chunks, start=1):
+        # Put obvious tokens into indexed content so vague queries like "attached file" match.
+        header = f"[ATTACHED_FILE] attached file name={filename} id={file_id} session={session_id} mime={mime} chunk={idx}/{total}\n"
+        content = header + chunk
+        source = f"upload:{file_id}:{idx}"
+        rows.append((source, content, 0, created_at))
+
+    try:
+        with db_lock:
+            if db.corpus_conn is not None:
+                db.corpus_conn.executemany(
+                    "INSERT INTO documents(source, content, tokens, created_at) VALUES (?, ?, ?, ?)",
+                    rows,
+                )
+                db.corpus_conn.commit()
+        return {"indexed": True, "chunks": len(chunks)}
+    except Exception as exc:
+        log_console(f"Corpus index failed for {filename}: {exc}", "WARN")
+        return {"indexed": False, "chunks": 0}
+
+
+@app.post("/v1/files")
+async def upload_file_endpoint(
+    file: UploadFile = File(...),
+    session_id: int | None = Form(None),
+):
+    try:
+        incoming_name = file.filename or "upload.bin"
+        safe_name = _safe_filename(incoming_name)
+        mime = (file.content_type or "application/octet-stream").strip().lower()
+
+        # Resolve / create a session
+        current_id = None
+        if session_id is not None and session_exists(session_id):
+            current_id = int(session_id)
+        else:
+            current_id = create_session(None)
+
+        data = await file.read()
+        size_bytes = len(data or b"")
+        if size_bytes <= 0:
+            return JSONResponse(content={"error": "empty_file", "message": "File is empty."}, status_code=400)
+        if size_bytes > int(MAX_FILE_MB * 1024 * 1024):
+            return JSONResponse(
+                content={"error": "file_too_large", "message": f"File exceeds {MAX_FILE_MB}MB limit."},
+                status_code=413,
+            )
+
+        sha256 = hashlib.sha256(data).hexdigest()
+        file_id = uuid.uuid4().hex
+
+        rel_dir = Path(str(current_id))
+        out_dir = FILE_DIR / rel_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{file_id}_{safe_name}"
+        out_path.write_bytes(data)
+        rel_path = str(rel_dir / out_path.name)
+
+        # Store metadata
+        db.insert_uploaded_file(
+            file_id=file_id,
+            session_id=current_id,
+            filename=safe_name,
+            mime=mime,
+            size_bytes=size_bytes,
+            sha256=sha256,
+            rel_path=rel_path,
+            conn=db_conn,
+            lock=db_lock,
+        )
+
+        # Extract/index text for text-like files.
+        extracted_text = ""
+        indexed = {"indexed": False, "chunks": 0}
+        is_text_like = (
+            mime.startswith("text/")
+            or mime in {"application/json", "application/xml", "application/x-yaml"}
+            or Path(safe_name).suffix.lower() in {".txt", ".md", ".py", ".js", ".ts", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".log", ".csv"}
+        )
+        if is_text_like:
+            extracted_text = (data.decode("utf-8", errors="replace") or "").strip()
+            if extracted_text:
+                indexed = _index_file_into_corpus(
+                    file_id=file_id,
+                    session_id=current_id,
+                    filename=safe_name,
+                    mime=mime,
+                    text=extracted_text,
+                )
+        elif mime == "application/pdf":
+            # MVP: store the PDF; indexing requires optional deps (pypdf/PyMuPDF/ocrmypdf).
+            indexed = {"indexed": False, "chunks": 0}
+
+        return {
+            "id": file_id,
+            "session_id": current_id,
+            "filename": safe_name,
+            "mime": mime,
+            "size_bytes": size_bytes,
+            "sha256": sha256,
+            **indexed,
+        }
+    except Exception as e:
+        log_console(f"File upload failed: {e}", "ERR")
+        return JSONResponse(content={"error": "upload_failed", "message": str(e)}, status_code=500)
+
+
+@app.get("/v1/files/{file_id}")
+async def download_file_endpoint(file_id: str):
+    meta = db.get_uploaded_file(file_id, conn=db_conn, lock=db_lock)
+    if not meta:
+        return JSONResponse(content={"error": "not_found", "message": "File not found."}, status_code=404)
+    rel_path = meta.get("path") or ""
+    file_path = FILE_DIR / rel_path
+    try:
+        data = file_path.read_bytes()
+    except Exception:
+        return JSONResponse(content={"error": "not_found", "message": "File not found."}, status_code=404)
+    media_type = meta.get("mime") or "application/octet-stream"
+    filename = meta.get("filename") or "download.bin"
+    return StreamingResponse(io.BytesIO(data), media_type=media_type, headers={
+        "Content-Disposition": f'attachment; filename="{filename}"'
+    })
 
 
 @app.post("/v1/audio/speech")
@@ -1364,17 +1568,18 @@ async def websocket_endpoint(websocket: WebSocket):
                         try:
                             user_text = (parsed_payload.get("prompt") or parsed_payload.get("text") or "").strip()
                             image_payloads = _normalize_image_payloads(parsed_payload.get("images") or [])
+                            file_payloads = _normalize_file_payloads(parsed_payload.get("files") or [], session_id=current_session_id)
                         except Exception as exc:
                             await websocket.send_text(f"LOG:AI: Error: {exc}")
                             await websocket.send_text("DONE")
                             continue
 
-                        if not user_text and not image_payloads:
+                        if not user_text and not image_payloads and not file_payloads:
                             await websocket.send_text("LOG:AI: Error: empty message.")
                             await websocket.send_text("DONE")
                             continue
 
-                        log_payload = {"text": user_text, "images": image_payloads}
+                        log_payload = {"text": user_text, "images": image_payloads, "files": file_payloads}
                         await websocket.send_text(f"LOG:User: {json.dumps(log_payload)}")
                         metrics = init_metrics("text", current_session_id)
                         current_task = asyncio.create_task(
@@ -1386,6 +1591,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 stop_event,
                                 current_session_id,
                                 image_payloads=image_payloads,
+                                file_payloads=file_payloads,
                                 generate_audio=False,
                                 client=client,
                                 kokoro=kokoro,

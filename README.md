@@ -199,6 +199,71 @@ Simon now supports **multi-image + prompt** messages for vision-capable models (
 
 **Model input format:** the user message becomes a multimodal `content` array with `text` + `image_url` data URLs, which llama.cpp and OpenAI-compatible backends accept.
 
+### F. File Attachments (Web UI) + Corpus-backed Recall
+
+Simon now supports attaching non-image files from the web UI (e.g. `.py`, `.txt`, `.md`, `.json`, `.yaml`, `.csv`, `.pdf`) and using them in answers through the existing recursive/tool path.
+
+**Why this design:** keep prompt windows small and push large file content into the Cold tier (`corpus.db`), then retrieve only relevant chunks via tools.
+
+**Endpoints:**
+- `POST /v1/files` (multipart): stores file, records metadata in `history.db`, and indexes text-like files into `corpus.db` (chunked FTS).
+- `GET /v1/files/{file_id}`: downloads original file bytes.
+
+**Session semantics:**
+- Uploads are session-scoped (`uploaded_files.session_id`).
+- When a user sends a message with `files: [...]`, the backend validates ownership and links file IDs to the user message (`message_files`).
+- In WS mode, attaching files **forces Deep Mode** so the agent can call tools and ground answers in evidence.
+
+**Tooling used by Deep Mode:**
+- `list_session_files`: enumerate attached files in current session.
+- `search_memory`: now searches FTS over warm history and cold corpus.
+- `read_corpus_doc(doc_id)`: fetch full chunk text for a corpus hit.
+
+**Indexing behavior (current):**
+- Text-like files are decoded as UTF-8 (replacement mode), chunked, and inserted into `corpus.db`.
+- Chunk headers include indexed tokens such as `ATTACHED_FILE`, `id=...`, `session=...`, `mime=...` to improve vague-query recall.
+- PDF files are currently stored but not indexed (see limitation below).
+
+**Limits / knobs:**
+- `SIMON_MAX_FILES_PER_MESSAGE` (default `5`)
+- `SIMON_MAX_FILE_MB` (default `10`)
+- `SIMON_CORPUS_CHUNK_CHARS` (default `1800`)
+- `SIMON_CORPUS_CHUNK_OVERLAP` (default `200`)
+- `SIMON_MAX_FILE_INLINE_CHARS` (reserved; default `6000`)
+
+**Current limitation (MVP):**
+- PDF indexing/OCR is not enabled yet. PDFs are attachable/downloadable, but semantic retrieval depends on future extractors (`pypdf`/`PyMuPDF` + OCR fallback).
+
+**Production SQL migration (history.db):**
+
+```sql
+CREATE TABLE IF NOT EXISTS uploaded_files (
+  id TEXT PRIMARY KEY,
+  session_id INTEGER NOT NULL,
+  filename TEXT NOT NULL,
+  mime TEXT,
+  size_bytes INTEGER,
+  sha256 TEXT,
+  path TEXT NOT NULL,
+  created_at REAL DEFAULT (strftime('%s','now')),
+  FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_uploaded_files_session
+  ON uploaded_files(session_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS message_files (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_id INTEGER NOT NULL,
+  file_id TEXT NOT NULL,
+  created_at REAL DEFAULT (strftime('%s','now')),
+  FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE,
+  FOREIGN KEY(file_id) REFERENCES uploaded_files(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_message_files_message ON message_files(message_id);
+CREATE INDEX IF NOT EXISTS idx_message_files_file ON message_files(file_id);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_message_files_msg_file ON message_files(message_id, file_id);
+```
+
 ---
 
 ## 4. Resilience Engineering: Preemptive Fixes

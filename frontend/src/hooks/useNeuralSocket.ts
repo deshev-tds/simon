@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { ConnectionStatus, ImageAttachment, LiveTranscript, Message, SessionSummary, StoredMessage } from '../types';
+import { ConnectionStatus, FileAttachment, ImageAttachment, LiveTranscript, Message, SessionSummary, StoredMessage } from '../types';
 
 const DEFAULT_WS_PORT = 8000;
 const getSocketUrl = () => {
@@ -82,6 +82,7 @@ export const useNeuralSocket = () => {
     sender: m.role === 'assistant' ? 'ai' : 'user',
     timestamp: m.created_at ? m.created_at * 1000 : Date.now(),
     images: Array.isArray(m.attachments) && m.attachments.length > 0 ? m.attachments : undefined,
+    files: Array.isArray(m.files) && m.files.length > 0 ? m.files : undefined,
   }), []);
 
   const loadSessionWindow = useCallback(async (sessionId: number) => {
@@ -314,13 +315,14 @@ export const useNeuralSocket = () => {
     }
   }, [isRecording]);
 
-  const addUserMessage = useCallback((text: string, images?: ImageAttachment[]) => {
+  const addUserMessage = useCallback((text: string, images?: ImageAttachment[], files?: FileAttachment[]) => {
     setMessages(prev => [...prev, {
       id: Date.now().toString() + Math.random(),
       text,
       sender: 'user',
       timestamp: Date.now(),
       images: images && images.length ? images : undefined,
+      files: files && files.length ? files : undefined,
     }]);
   }, []);
 
@@ -451,7 +453,8 @@ export const useNeuralSocket = () => {
               const parsed = JSON.parse(payload);
               const msgText = typeof parsed?.text === 'string' ? parsed.text : '';
               const images = Array.isArray(parsed?.images) ? parsed.images : undefined;
-              addUserMessage(msgText, images);
+              const files = Array.isArray(parsed?.files) ? parsed.files : undefined;
+              addUserMessage(msgText, images, files);
             } catch (err) {
               addUserMessage(payload);
             }
@@ -506,17 +509,19 @@ export const useNeuralSocket = () => {
     socketRef.current = ws;
   }, [addUserMessage, appendAiDelta, finalizeAiMessage, finalizeStreamingMessage, handleBinaryMessage, loadSessionWindow, persistSessionId, refreshSessions, socketCandidates]);
 
-  const sendMessage = useCallback(async (payload: { text: string; images?: ImageAttachment[] }) => {
+  const sendMessage = useCallback(async (payload: { text: string; images?: ImageAttachment[]; files?: FileAttachment[] }) => {
     const text = (payload?.text ?? '').trim();
     const images = Array.isArray(payload?.images) ? payload.images : [];
-    if (!text && images.length === 0) return;
+    const files = Array.isArray(payload?.files) ? payload.files : [];
+    if (!text && images.length === 0 && files.length === 0) return;
 
     if (socketRef.current?.readyState === WebSocket.OPEN) {
-      if (images.length > 0) {
+      if (images.length > 0 || files.length > 0) {
         socketRef.current.send(JSON.stringify({
           type: 'chat',
           prompt: text,
           images,
+          files: files.map((f) => ({ id: f.id })),
         }));
       } else {
         socketRef.current.send(text);
@@ -526,8 +531,12 @@ export const useNeuralSocket = () => {
     }
 
     try {
-      addUserMessage(text, images);
+      addUserMessage(text, images, files);
       setIsAwaitingResponse(true);
+      if (files.length > 0) {
+        finalizeAiMessage('Error: file attachments require an active websocket connection.');
+        return;
+      }
       const res = await callApi('/v1/chat/vision', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -555,6 +564,33 @@ export const useNeuralSocket = () => {
     }
   }, [addUserMessage, callApi, finalizeAiMessage, loadSessionWindow, persistSessionId, refreshSessions]);
 
+  const uploadFile = useCallback(async (file: File): Promise<FileAttachment> => {
+    const fd = new FormData();
+    fd.append('file', file);
+    if (currentSessionIdRef.current) {
+      fd.append('session_id', String(currentSessionIdRef.current));
+    }
+    const res = await callApi('/v1/files', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (typeof data?.session_id === 'number') {
+      persistSessionId(data.session_id);
+      pendingSessionRef.current = data.session_id;
+      if (socketRef.current?.readyState === WebSocket.OPEN) {
+        socketRef.current.send(`SESSION:${data.session_id}`);
+      }
+      await refreshSessions();
+    }
+    return {
+      id: String(data?.id ?? ''),
+      filename: String(data?.filename ?? file.name ?? 'upload.bin'),
+      mime: typeof data?.mime === 'string' ? data.mime : null,
+      size_bytes: typeof data?.size_bytes === 'number' ? data.size_bytes : file.size,
+      sha256: typeof data?.sha256 === 'string' ? data.sha256 : null,
+      indexed: Boolean(data?.indexed),
+      chunks: typeof data?.chunks === 'number' ? data.chunks : undefined,
+    };
+  }, [callApi, persistSessionId, refreshSessions]);
+
   useEffect(() => {
     connect();
     return () => { 
@@ -566,6 +602,7 @@ export const useNeuralSocket = () => {
     status, 
     messages, 
     sendMessage, 
+    uploadFile,
     startRecording, 
     stopRecording,
     aiIsSpeaking,

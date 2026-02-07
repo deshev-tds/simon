@@ -25,6 +25,7 @@ from backend.config import (
     MEM_HOT_SESSION_LIMIT,
     TEST_MODE,
     IMAGE_DIR,
+    FILE_DIR,
 )
 
 db_lock = threading.Lock()
@@ -97,6 +98,37 @@ def init_db(db_path=DB_PATH):
                 )
             """)
             existing_conn.execute("CREATE INDEX IF NOT EXISTS idx_attachments_message ON message_attachments(message_id)")
+
+            # --- File uploads (metadata + message links) ---
+            existing_conn.execute("""
+                CREATE TABLE IF NOT EXISTS uploaded_files (
+                    id TEXT PRIMARY KEY,
+                    session_id INTEGER NOT NULL,
+                    filename TEXT NOT NULL,
+                    mime TEXT,
+                    size_bytes INTEGER,
+                    sha256 TEXT,
+                    path TEXT NOT NULL,
+                    created_at REAL DEFAULT (strftime('%s','now')),
+                    FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                )
+            """)
+            existing_conn.execute("CREATE INDEX IF NOT EXISTS idx_uploaded_files_session ON uploaded_files(session_id, created_at DESC)")
+
+            existing_conn.execute("""
+                CREATE TABLE IF NOT EXISTS message_files (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id INTEGER NOT NULL,
+                    file_id TEXT NOT NULL,
+                    created_at REAL DEFAULT (strftime('%s','now')),
+                    FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE,
+                    FOREIGN KEY(file_id) REFERENCES uploaded_files(id) ON DELETE CASCADE
+                )
+            """)
+            existing_conn.execute("CREATE INDEX IF NOT EXISTS idx_message_files_message ON message_files(message_id)")
+            existing_conn.execute("CREATE INDEX IF NOT EXISTS idx_message_files_file ON message_files(file_id)")
+            existing_conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_message_files_msg_file ON message_files(message_id, file_id)")
+
             existing_conn.commit()
             db_conn = existing_conn
             return existing_conn
@@ -145,8 +177,35 @@ def init_db(db_path=DB_PATH):
             FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS uploaded_files (
+            id TEXT PRIMARY KEY,
+            session_id INTEGER NOT NULL,
+            filename TEXT NOT NULL,
+            mime TEXT,
+            size_bytes INTEGER,
+            sha256 TEXT,
+            path TEXT NOT NULL,
+            created_at REAL DEFAULT (strftime('%s','now')),
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS message_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id INTEGER NOT NULL,
+            file_id TEXT NOT NULL,
+            created_at REAL DEFAULT (strftime('%s','now')),
+            FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE,
+            FOREIGN KEY(file_id) REFERENCES uploaded_files(id) ON DELETE CASCADE
+        )
+    """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_session_created ON messages(session_id, created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_attachments_message ON message_attachments(message_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_uploaded_files_session ON uploaded_files(session_id, created_at DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_message_files_message ON message_files(message_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_message_files_file ON message_files(file_id)")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_message_files_msg_file ON message_files(message_id, file_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC)")
 
     conn.commit()
@@ -656,6 +715,133 @@ def _write_attachment_file(session_id: int, message_id: int, idx: int, data_b64:
     return rel_path, len(data)
 
 
+def insert_uploaded_file(
+    file_id: str,
+    session_id: int,
+    filename: str,
+    mime: str | None,
+    size_bytes: int,
+    sha256: str | None,
+    rel_path: str,
+    created_at: float | None = None,
+    conn=None,
+    lock=None,
+):
+    ts = time.time() if created_at is None else float(created_at)
+    target_conn = _resolve_conn(conn)
+    target_lock = _resolve_lock(lock)
+    with target_lock:
+        target_conn.execute(
+            """
+            INSERT OR REPLACE INTO uploaded_files(id, session_id, filename, mime, size_bytes, sha256, path, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(file_id),
+                int(session_id),
+                str(filename or ""),
+                str(mime or ""),
+                int(size_bytes or 0),
+                str(sha256 or ""),
+                str(rel_path or ""),
+                ts,
+            ),
+        )
+        target_conn.commit()
+
+
+def get_uploaded_file(file_id: str, conn=None, lock=None) -> dict | None:
+    if not file_id:
+        return None
+    target_conn = _resolve_conn(conn)
+    target_lock = _resolve_lock(lock)
+    with target_lock:
+        row = target_conn.execute(
+            """
+            SELECT id, session_id, filename, mime, size_bytes, sha256, path, created_at
+            FROM uploaded_files
+            WHERE id=?
+            """,
+            (str(file_id),),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "session_id": row[1],
+        "filename": row[2],
+        "mime": row[3],
+        "size_bytes": row[4],
+        "sha256": row[5],
+        "path": row[6],
+        "created_at": row[7],
+    }
+
+
+def list_session_files(session_id: int, limit: int = 50, conn=None, lock=None) -> list[dict]:
+    target_conn = _resolve_conn(conn)
+    target_lock = _resolve_lock(lock)
+    with target_lock:
+        rows = target_conn.execute(
+            """
+            SELECT id, filename, mime, size_bytes, sha256, created_at
+            FROM uploaded_files
+            WHERE session_id=?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (int(session_id), int(max(1, min(limit, 200)))),
+        ).fetchall()
+    return [{
+        "id": r[0],
+        "filename": r[1],
+        "mime": r[2],
+        "size_bytes": r[3],
+        "sha256": r[4],
+        "created_at": r[5],
+    } for r in rows]
+
+
+def _load_message_files(message_ids, conn):
+    if not message_ids:
+        return {}
+    placeholders = ",".join(["?"] * len(message_ids))
+    rows = conn.execute(
+        f"""
+        SELECT mf.message_id, f.id, f.filename, f.mime, f.size_bytes, f.sha256, f.created_at
+        FROM message_files mf
+        JOIN uploaded_files f ON f.id = mf.file_id
+        WHERE mf.message_id IN ({placeholders})
+        ORDER BY mf.id ASC
+        """,
+        tuple(message_ids),
+    ).fetchall()
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(row[0], []).append({
+            "id": row[1],
+            "filename": row[2],
+            "mime": row[3],
+            "size_bytes": row[4],
+            "sha256": row[5],
+            "created_at": row[6],
+        })
+    return grouped
+
+
+def _attach_files_to_message(message_id: int, file_ids: list[str], conn: sqlite3.Connection, ts: float):
+    if not file_ids:
+        return
+    for fid in file_ids:
+        fid = (str(fid or "")).strip()
+        if not fid:
+            continue
+        conn.execute(
+            "INSERT OR IGNORE INTO message_files(message_id, file_id, created_at) VALUES (?, ?, ?)",
+            (int(message_id), fid, float(ts)),
+        )
+
+
 def _insert_message(target_conn, session_id, role, content, tokens, created_at):
     cur = target_conn.execute(
         "INSERT INTO messages(session_id, role, content, tokens, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -761,6 +947,72 @@ def save_interaction_with_attachments(session_id, user_text, ai_text, attachment
                     print(f"[WARN] In-memory DB insert failed: {_e}")
 
 
+def save_interaction_with_assets(
+    session_id,
+    user_text,
+    ai_text,
+    image_attachments=None,
+    file_ids=None,
+    conn=None,
+    mem=None,
+    lock=None,
+):
+    ts = time.time()
+    target_conn = _resolve_conn(conn)
+    target_lock = _resolve_lock(lock)
+    target_mem = mem if mem is not None else mem_conn
+    image_attachments = image_attachments or []
+    file_ids = file_ids or []
+    with target_lock:
+        user_id = _insert_message(target_conn, session_id, "user", user_text, 0, ts)
+        _insert_message(target_conn, session_id, "assistant", ai_text, 0, ts)
+
+        # Images -> message_attachments
+        for idx, att in enumerate(image_attachments):
+            if not isinstance(att, dict):
+                continue
+            rel_path, actual_size = _write_attachment_file(
+                int(session_id),
+                int(user_id),
+                int(idx),
+                str(att.get("data_b64") or ""),
+                att.get("mime"),
+            )
+            if not rel_path:
+                continue
+            mime = att.get("mime")
+            width = att.get("width")
+            height = att.get("height")
+            size_bytes = int(att.get("size_bytes") or actual_size or 0)
+            target_conn.execute(
+                """
+                INSERT INTO message_attachments(message_id, kind, path, mime, width, height, size_bytes, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, "image", rel_path, mime, width, height, size_bytes, ts),
+            )
+
+        # Files -> message_files
+        _attach_files_to_message(int(user_id), list(file_ids), target_conn, ts)
+
+        target_conn.execute("UPDATE sessions SET updated_at=? WHERE id=?", (ts, session_id))
+        target_conn.commit()
+
+        if target_mem is not None:
+            allow_mem_write = mem is not None or (
+                mem_active_session_id is not None and int(session_id) == int(mem_active_session_id)
+            )
+            if not allow_mem_write:
+                return
+            try:
+                _insert_message(target_mem, session_id, "user", user_text, 0, ts)
+                _insert_message(target_mem, session_id, "assistant", ai_text, 0, ts)
+                target_mem.commit()
+            except Exception as _e:
+                if DEBUG_MODE:
+                    print(f"[WARN] In-memory DB insert failed: {_e}")
+
+
 def set_session_title(session_id, title, conn=None, lock=None):
     target_conn = _resolve_conn(conn)
     target_lock = _resolve_lock(lock)
@@ -832,6 +1084,7 @@ def get_session_window(session_id, anchor=ANCHOR_MESSAGES, recent=MAX_RECENT_MES
 
     message_ids = [r[0] for r in anchor_rows + recent_rows]
     attachments = _load_message_attachments(message_ids, target_conn)
+    file_attachments = _load_message_files(message_ids, target_conn)
 
     def map_row(row):
         msg = {
@@ -858,6 +1111,8 @@ def get_session_window(session_id, anchor=ANCHOR_MESSAGES, recent=MAX_RECENT_MES
                 })
             if payloads:
                 msg["attachments"] = payloads
+        if row[0] in file_attachments:
+            msg["files"] = file_attachments[row[0]]
         return msg
 
     return {
@@ -1333,6 +1588,10 @@ __all__ = [
     "get_session_transcript",
     "save_interaction",
     "save_interaction_with_attachments",
+    "save_interaction_with_assets",
+    "insert_uploaded_file",
+    "get_uploaded_file",
+    "list_session_files",
     "set_session_title",
     "get_session_window",
     "_fts_tokenize",

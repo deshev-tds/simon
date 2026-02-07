@@ -82,6 +82,8 @@ _CITY_PATTERN = re.compile(r"\b(?:in|at|from|near|to)\s+([A-Z][a-z]+(?:\s+[A-Z][
 _DEEP_SYSTEM_PROMPT = (
     "You are Simon (Deep Mode). You MUST call search_memory before answering. "
     "Use scope='global' unless the user explicitly asks about the current session. "
+    "If the user references an attached file without naming it, call list_session_files. "
+    "If you need more context from a CORPUS hit, call read_corpus_doc(doc_id). "
     "Answer ONLY from tool evidence above. If no evidence is found, reply exactly: not found. "
     "Do not hallucinate."
 )
@@ -557,14 +559,26 @@ def _extract_message_text(msg):
     return getattr(msg, "content", "") or ""
 
 
-def _build_user_message(user_text: str, image_payloads: list[dict] | None):
+def _build_user_message(user_text: str, image_payloads: list[dict] | None, file_payloads: list[dict] | None = None):
+    text = user_text or ""
+    if file_payloads:
+        lines = ["[ATTACHED_FILES]"]
+        for f in file_payloads:
+            if not isinstance(f, dict):
+                continue
+            fid = (f.get("id") or "").strip()
+            name = (f.get("filename") or "").strip()
+            mime = (f.get("mime") or "").strip()
+            size_b = f.get("size_bytes")
+            lines.append(f"- {name} (id={fid}, mime={mime}, size={size_b} bytes)")
+        lines.append("[/ATTACHED_FILES]")
+        block = "\n".join(lines)
+        text = f"{text}\n\n{block}".strip() if text.strip() else block
+
     if not image_payloads:
-        return {"role": "user", "content": user_text}
+        return {"role": "user", "content": text}
     parts = []
-    if user_text:
-        parts.append({"type": "text", "text": user_text})
-    else:
-        parts.append({"type": "text", "text": ""})
+    parts.append({"type": "text", "text": text})
     for img in image_payloads:
         mime = (img.get("mime") or "image/jpeg").strip()
         data_b64 = (img.get("data_b64") or "").strip()
@@ -627,11 +641,14 @@ def _probe_retrieval(user_text, memory, session_id):
     t_start = time.time()
     retrieved_docs, distances, metadatas = memory.search(user_text, n_results=3, days_filter=60)
     try:
+        target_conn = db.db_conn
+        if db.mem_conn is not None and db.mem_active_session_id is not None and int(db.mem_active_session_id) == int(session_id):
+            target_conn = db.mem_conn
         fts_hits = db.fts_recursive_search(
             user_text,
             session_id=session_id,
             limit=FTS_MAX_HITS,
-            conn=db.db_conn,
+            conn=target_conn,
             lock=db.db_lock,
         )
     except Exception:
@@ -918,6 +935,7 @@ async def process_and_stream_response(
     stop_event,
     session_id,
     image_payloads=None,
+    file_payloads=None,
     generate_audio=True,
     *,
     client,
@@ -934,6 +952,8 @@ async def process_and_stream_response(
     store_user_text = user_text or ""
     if image_payloads and not store_user_text.strip():
         store_user_text = "[image]"
+    if file_payloads and not store_user_text.strip():
+        store_user_text = "[file]"
 
     t_ctx_start = time.time()
     retrieval_cache = _probe_retrieval(user_text, memory, session_id)
@@ -960,7 +980,12 @@ async def process_and_stream_response(
             log_console(f"RLM gate: {json.dumps(metrics['rlm_gate'], ensure_ascii=False)}", "TRACE")
         except Exception:
             log_console(f"RLM gate: {metrics.get('rlm_gate')}", "TRACE")
-    is_deep_mode = gate_decision.trigger
+    forced_by_files = bool(file_payloads)
+    if forced_by_files and not gate_decision.trigger:
+        metrics.setdefault("rlm_gate", {})
+        if isinstance(metrics.get("rlm_gate"), dict):
+            metrics["rlm_gate"]["forced_by_files"] = True
+    is_deep_mode = gate_decision.trigger or forced_by_files
 
     current_messages = []
     rag_payload = []
@@ -972,7 +997,7 @@ async def process_and_stream_response(
         current_messages = _with_system_prompt([
             {"role": "system", "content": _DEEP_SYSTEM_PROMPT},
             *deep_history,
-            _build_user_message(user_text, image_payloads),
+            _build_user_message(user_text, image_payloads, file_payloads),
         ])
         tools_list = tools.SIMON_TOOLS
     else:
@@ -984,7 +1009,7 @@ async def process_and_stream_response(
             session_id,
             retrieval_cache=retrieval_cache,
         )
-        current_messages = _with_system_prompt(context_msgs + [_build_user_message(user_text, image_payloads)])
+        current_messages = _with_system_prompt(context_msgs + [_build_user_message(user_text, image_payloads, file_payloads)])
         tools_list = None
 
     metrics["ctx"] = time.time() - t_ctx_start
@@ -1026,7 +1051,7 @@ async def process_and_stream_response(
         deep_messages = _with_system_prompt([
             {"role": "system", "content": _DEEP_SYSTEM_PROMPT},
             *deep_history,
-            {"role": "user", "content": user_text},
+            _build_user_message(user_text, image_payloads, file_payloads),
         ])
         tool_chars_used = 0
         turn_count = 0
@@ -1098,6 +1123,20 @@ async def process_and_stream_response(
                                 get_current_model,
                                 target_session,
                                 instruction,
+                            )
+                    elif fn_name == "list_session_files":
+                        result = tools.tool_list_session_files(
+                            session_id,
+                            db_lock=db.db_lock,
+                        )
+                    elif fn_name == "read_corpus_doc":
+                        doc_id = args.get("doc_id")
+                        if doc_id is None:
+                            result = "Error: read_corpus_doc requires doc_id."
+                        else:
+                            result = tools.tool_read_corpus_doc(
+                                int(doc_id),
+                                db_lock=db.db_lock,
                             )
 
                     result_str = str(result)
@@ -1369,6 +1408,20 @@ async def process_and_stream_response(
                                         target_session,
                                         instruction,
                                     )
+                            elif fn_name == "list_session_files":
+                                result = tools.tool_list_session_files(
+                                    session_id,
+                                    db_lock=db.db_lock,
+                                )
+                            elif fn_name == "read_corpus_doc":
+                                doc_id = args.get("doc_id")
+                                if doc_id is None:
+                                    result = "Error: read_corpus_doc requires doc_id."
+                                else:
+                                    result = tools.tool_read_corpus_doc(
+                                        int(doc_id),
+                                        db_lock=db.db_lock,
+                                    )
 
                             result_str = str(result)
                             remain = MAX_TOOL_OUTPUT_CHARS - tool_chars_used
@@ -1611,7 +1664,7 @@ async def process_and_stream_response(
                 except Exception as e:
                     print(f"Streaming Error: {e}")
 
-            if (not is_deep_mode) and RLM_FALLBACK_ENABLED and (not generate_audio) and not image_payloads and not stop_evt.is_set():
+            if (not is_deep_mode) and RLM_FALLBACK_ENABLED and (not generate_audio) and not image_payloads and not file_payloads and not stop_evt.is_set():
                 final_text_buffer, _fallback_reason = _run_text_fallback(
                     final_text_buffer,
                     model_name,
@@ -1673,9 +1726,16 @@ async def process_and_stream_response(
                     args=(history_snapshot, session_id, client, get_current_model, memory),
                 ).start()
             if image_payloads:
+                file_ids = [f.get("id") for f in (file_payloads or []) if isinstance(f, dict) and f.get("id")]
                 threading.Thread(
-                    target=db.save_interaction_with_attachments,
-                    args=(session_id, store_user_text, full_reply, image_payloads),
+                    target=db.save_interaction_with_assets,
+                    args=(session_id, store_user_text, full_reply, image_payloads, file_ids),
+                ).start()
+            elif file_payloads:
+                file_ids = [f.get("id") for f in (file_payloads or []) if isinstance(f, dict) and f.get("id")]
+                threading.Thread(
+                    target=db.save_interaction_with_assets,
+                    args=(session_id, store_user_text, full_reply, None, file_ids),
                 ).start()
             else:
                 threading.Thread(target=db.save_interaction, args=(session_id, store_user_text, full_reply)).start()

@@ -1,12 +1,13 @@
 import React, { useEffect, useRef, useState, useLayoutEffect } from 'react';
-import { ConnectionStatus, ImageAttachment, Message } from '../types';
+import { ConnectionStatus, FileAttachment, ImageAttachment, Message } from '../types';
 import MarkdownMessage from './MarkdownMessage';
-import { IconImage, IconMenu, IconSend, IconTerminal, IconWifi, IconWifiOff, IconWaveform, IconX } from './Icons';
+import { IconImage, IconMenu, IconPaperclip, IconSend, IconTerminal, IconWifi, IconWifiOff, IconWaveform, IconX } from './Icons';
 
 interface ChatViewProps {
   status: ConnectionStatus;
   messages: Message[];
-  onSendMessage: (payload: { text: string; images?: ImageAttachment[] }) => void;
+  onSendMessage: (payload: { text: string; images?: ImageAttachment[]; files?: FileAttachment[] }) => void;
+  onUploadFile: (file: File) => Promise<FileAttachment>;
   onCallStart: () => void;
   onOpenDrawer: () => void;
   sessionTitle?: string;
@@ -22,13 +23,17 @@ const IconArrowDown: React.FC<{ className?: string }> = ({ className }) => (
   </svg>
 );
 
-const ChatView: React.FC<ChatViewProps> = ({ status, messages, onSendMessage, onCallStart, onOpenDrawer, sessionTitle, isLoadingSession, isAwaitingResponse }) => {
+const ChatView: React.FC<ChatViewProps> = ({ status, messages, onSendMessage, onUploadFile, onCallStart, onOpenDrawer, sessionTitle, isLoadingSession, isAwaitingResponse }) => {
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
+  const attachFileInputRef = useRef<HTMLInputElement>(null);
   const [inputValue, setInputValue] = useState('');
   const [pendingImages, setPendingImages] = useState<(ImageAttachment & { previewUrl: string })[]>([]);
   const [imageError, setImageError] = useState<string | null>(null);
+  const [pendingFiles, setPendingFiles] = useState<FileAttachment[]>([]);
+  const [fileError, setFileError] = useState<string | null>(null);
+  const [isUploadingFiles, setIsUploadingFiles] = useState(false);
   const [showScrollButton, setShowScrollButton] = useState(false);
   const [isUserAtBottom, setIsUserAtBottom] = useState(true);
   const hasStreamingMessage = messages.some((msg) => msg.sender === 'ai' && msg.isStreaming);
@@ -36,6 +41,8 @@ const ChatView: React.FC<ChatViewProps> = ({ status, messages, onSendMessage, on
 
   const MAX_IMAGES = 10;
   const MAX_IMAGE_MB = 8;
+  const MAX_FILES = 5;
+  const MAX_FILE_MB = 10;
   // Note: This is the processed image that is both:
   // 1) rendered in the chat history, and
   // 2) sent to the backend/model.
@@ -94,6 +101,21 @@ const ChatView: React.FC<ChatViewProps> = ({ status, messages, onSendMessage, on
   const buildDataUrl = (mime: string, base64: string) => {
     if (base64.startsWith('data:')) return base64;
     return `data:${mime};base64,${base64}`;
+  };
+
+  const getFileDownloadUrl = (fileId: string) => {
+    const base = import.meta.env.VITE_API_URL;
+    if (base) return `${base}/v1/files/${fileId}`;
+    return `/v1/files/${fileId}`;
+  };
+
+  const formatBytes = (bytes?: number | null) => {
+    const b = typeof bytes === 'number' ? bytes : 0;
+    if (!b) return '';
+    const mb = b / (1024 * 1024);
+    if (mb >= 1) return `${mb.toFixed(1)}MB`;
+    const kb = b / 1024;
+    return `${Math.max(1, Math.round(kb))}KB`;
   };
 
   const processFile = async (file: File): Promise<(ImageAttachment & { previewUrl: string }) | null> => {
@@ -247,16 +269,59 @@ const ChatView: React.FC<ChatViewProps> = ({ status, messages, onSendMessage, on
     setPendingImages(prev => prev.filter(img => img.id !== id));
   };
 
+  const removePendingFile = (id: string) => {
+    setPendingFiles(prev => prev.filter(f => f.id !== id));
+  };
+
+  const handleAttachFilesSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
+
+    setFileError(null);
+    const remaining = MAX_FILES - pendingFiles.length;
+    const slice = files.slice(0, remaining);
+    if (files.length > remaining) {
+      setFileError(`Only ${MAX_FILES} files allowed per message.`);
+    }
+
+    setIsUploadingFiles(true);
+    const uploaded: FileAttachment[] = [];
+    try {
+      for (const file of slice) {
+        if (file.size > MAX_FILE_MB * 1024 * 1024) {
+          setFileError(`File too large: ${file.name} (limit: ${MAX_FILE_MB}MB)`);
+          continue;
+        }
+        try {
+          const meta = await onUploadFile(file);
+          if (meta?.id) uploaded.push(meta);
+        } catch (err) {
+          setFileError(`Upload failed: ${file.name}`);
+        }
+      }
+    } finally {
+      setIsUploadingFiles(false);
+      if (uploaded.length > 0) {
+        setPendingFiles(prev => [...prev, ...uploaded].slice(0, MAX_FILES));
+      }
+      e.target.value = '';
+    }
+  };
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (inputValue.trim() || pendingImages.length > 0) {
+    if (isUploadingFiles) return;
+    if (inputValue.trim() || pendingImages.length > 0 || pendingFiles.length > 0) {
       onSendMessage({
         text: inputValue,
         images: pendingImages.map(({ previewUrl, ...rest }) => rest),
+        files: pendingFiles,
       });
       setInputValue('');
       setPendingImages([]);
+      setPendingFiles([]);
       setImageError(null);
+      setFileError(null);
       
       // Force scroll on user send
       setIsUserAtBottom(true);
@@ -361,6 +426,20 @@ const ChatView: React.FC<ChatViewProps> = ({ status, messages, onSendMessage, on
                         ))}
                       </div>
                     )}
+                    {msg.files && msg.files.length > 0 && (
+                      <div className="space-y-1">
+                        {msg.files.map((f) => (
+                          <a
+                            key={`${msg.id}-file-${f.id}`}
+                            href={getFileDownloadUrl(f.id)}
+                            className="block text-[11px] font-mono text-zinc-300 hover:text-white underline decoration-white/10 hover:decoration-accent/50 truncate"
+                            title={f.filename}
+                          >
+                            {f.filename}{f.size_bytes ? ` (${formatBytes(f.size_bytes)})` : ''}
+                          </a>
+                        ))}
+                      </div>
+                    )}
                     {msg.text && <span className="whitespace-pre-wrap">{msg.text}</span>}
                   </div>
                 )}
@@ -416,9 +495,44 @@ const ChatView: React.FC<ChatViewProps> = ({ status, messages, onSendMessage, on
               </div>
             </div>
           )}
+          {pendingFiles.length > 0 && (
+            <div className="flex flex-wrap gap-2">
+              {pendingFiles.map((f) => (
+                <div key={f.id} className="flex items-center gap-2 max-w-full px-3 py-2 rounded-full border border-white/10 bg-zinc-900/70">
+                  <span className="text-[10px] font-mono text-zinc-300 truncate max-w-[14rem]" title={f.filename}>
+                    {f.filename}
+                  </span>
+                  {f.size_bytes ? (
+                    <span className="text-[10px] font-mono text-zinc-600 flex-none">{formatBytes(f.size_bytes)}</span>
+                  ) : null}
+                  <button
+                    type="button"
+                    onClick={() => removePendingFile(f.id)}
+                    className="p-1 rounded-full bg-zinc-900/80 text-zinc-300 hover:text-white border border-white/10 flex-none"
+                    aria-label="Remove file"
+                  >
+                    <IconX className="w-3 h-3" />
+                  </button>
+                </div>
+              ))}
+              {isUploadingFiles && (
+                <div className="flex items-center text-[10px] text-zinc-500 font-mono tracking-widest px-2">
+                  Uploading…
+                </div>
+              )}
+              <div className="flex items-center text-[10px] text-zinc-500 font-mono tracking-widest px-2">
+                {pendingFiles.length} / {MAX_FILES}
+              </div>
+            </div>
+          )}
           {imageError && (
             <div className="text-[10px] text-danger/80 font-mono tracking-widest uppercase">
               {imageError}
+            </div>
+          )}
+          {fileError && (
+            <div className="text-[10px] text-danger/80 font-mono tracking-widest uppercase">
+              {fileError}
             </div>
           )}
 
@@ -434,7 +548,7 @@ const ChatView: React.FC<ChatViewProps> = ({ status, messages, onSendMessage, on
 
             <button
               type="button"
-              onClick={() => fileInputRef.current?.click()}
+              onClick={() => imageInputRef.current?.click()}
               className="flex-none shrink-0 p-3 rounded-full text-zinc-500 hover:text-accent hover:bg-white/5 transition-colors touch-manipulation"
               aria-label="Attach images"
             >
@@ -442,12 +556,30 @@ const ChatView: React.FC<ChatViewProps> = ({ status, messages, onSendMessage, on
             </button>
 
             <input
-              ref={fileInputRef}
+              ref={imageInputRef}
               type="file"
               accept="image/*"
               multiple
               className="hidden"
               onChange={handleFilesSelected}
+            />
+
+            <button
+              type="button"
+              onClick={() => attachFileInputRef.current?.click()}
+              className="flex-none shrink-0 p-3 rounded-full text-zinc-500 hover:text-accent hover:bg-white/5 transition-colors touch-manipulation"
+              aria-label="Attach files"
+            >
+              <IconPaperclip className="w-4 h-4" />
+            </button>
+
+            <input
+              ref={attachFileInputRef}
+              type="file"
+              accept=".txt,.md,.py,.js,.ts,.json,.yaml,.yml,.toml,.ini,.cfg,.log,.csv,application/pdf"
+              multiple
+              className="hidden"
+              onChange={handleAttachFilesSelected}
             />
 
             <div className="flex-1 min-w-[12rem] flex items-center gap-2 bg-zinc-900/50 border border-white/5 rounded-full p-1 pl-4 backdrop-blur-md shadow-lg">
@@ -463,9 +595,9 @@ const ChatView: React.FC<ChatViewProps> = ({ status, messages, onSendMessage, on
 
               <button
                 type="submit"
-                disabled={!inputValue.trim() && pendingImages.length === 0}
+                disabled={isUploadingFiles || (!inputValue.trim() && pendingImages.length === 0 && pendingFiles.length === 0)}
                 className={`flex-none shrink-0 p-3 rounded-full transition-all duration-300 touch-manipulation ${
-                  inputValue.trim() || pendingImages.length > 0
+                  (inputValue.trim() || pendingImages.length > 0 || pendingFiles.length > 0) && !isUploadingFiles
                     ? 'bg-zinc-800 text-zinc-200 hover:text-accent'
                     : 'bg-transparent text-zinc-700 cursor-not-allowed'
                 }`}

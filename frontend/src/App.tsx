@@ -11,6 +11,7 @@ const App: React.FC = () => {
     status, 
     messages, 
     sendMessage, 
+    uploadFile,
     startRecording, 
     stopRecording, 
     aiIsSpeaking,
@@ -51,6 +52,7 @@ const App: React.FC = () => {
         status={status}
         messages={messages}
         onSendMessage={sendMessage}
+        onUploadFile={uploadFile}
         onCallStart={() => setMode(AppMode.VOICE)}
         onOpenDrawer={() => setDrawerOpen(true)}
         sessionTitle={currentSessionTitle}

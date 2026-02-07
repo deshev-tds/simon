@@ -55,6 +55,33 @@ SIMON_TOOLS = [
             }
         }
     }
+    ,
+    {
+        "type": "function",
+        "function": {
+            "name": "list_session_files",
+            "description": "List files uploaded in the current session (metadata only). Use when the user references an attached file without naming it.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_corpus_doc",
+            "description": "Read a corpus document chunk by doc_id (from CORPUS search results). Use to fetch more context than the search excerpt.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "doc_id": {"type": "integer"}
+                },
+                "required": ["doc_id"]
+            }
+        }
+    }
 ]
 
 
@@ -104,6 +131,13 @@ def tool_search_memory(
     fts_res: list[dict] = []
     corpus_res: list[dict] = []
     target_conn = db.db_conn
+    # Use hot-session memdb for current session when available.
+    if scope == "session" and session_id is not None:
+        try:
+            if db.mem_conn is not None and db.mem_active_session_id is not None and int(db.mem_active_session_id) == int(session_id):
+                target_conn = db.mem_conn
+        except Exception:
+            target_conn = db.db_conn
     if scope == "session":
         fts_res = db.fts_recursive_search(
             query,
@@ -112,6 +146,15 @@ def tool_search_memory(
             conn=target_conn,
             lock=lock,
         )
+        # Also search the CORPUS for this session's uploaded file chunks. We don't have a
+        # separate indexed "session_id" column in corpus, so we filter via the header token.
+        if session_id is not None:
+            corpus_res = db.fts_recursive_search_corpus(
+                f"{query} session {int(session_id)}",
+                limit=3,
+                conn=db.corpus_conn,
+                lock=lock,
+            )
     elif scope == "recent":
         fts_res = db.fts_recursive_search(
             query,
@@ -253,6 +296,61 @@ def tool_search_memory(
     return full_resp
 
 
+def tool_list_session_files(
+    session_id: int | None,
+    db_lock=None,
+):
+    if session_id is None:
+        return "Error: session_id is required."
+    lock = db_lock or db.db_lock
+    try:
+        rows = db.list_session_files(int(session_id), limit=50, conn=db.db_conn, lock=lock)
+    except Exception as exc:
+        return f"Error: list_session_files failed: {exc}"
+    if not rows:
+        return "No uploaded files found in this session."
+    lines = []
+    for f in rows[:50]:
+        lines.append(f"- {f.get('filename')} (id={f.get('id')}, mime={f.get('mime')}, size={f.get('size_bytes')} bytes)")
+    payload = {"files": rows[:50], "lines": lines}
+    out = f"FILES_JSON: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}"
+    if lines:
+        out += "\n" + "\n".join(lines)
+    if len(out) > MAX_TOOL_OUTPUT_CHARS:
+        return out[:MAX_TOOL_OUTPUT_CHARS] + "...[TRUNCATED]"
+    return out
+
+
+def tool_read_corpus_doc(
+    doc_id: int,
+    db_lock=None,
+):
+    lock = db_lock or db.db_lock
+    try:
+        target_conn = db.corpus_conn
+        if target_conn is None:
+            return "Error: corpus database is not initialized."
+        with lock:
+            row = target_conn.execute(
+                "SELECT id, source, content, created_at FROM documents WHERE id=?",
+                (int(doc_id),),
+            ).fetchone()
+    except Exception as exc:
+        return f"Error: read_corpus_doc failed: {exc}"
+    if not row:
+        return "not found"
+    payload = {
+        "id": row[0],
+        "source": row[1],
+        "created_at": row[3],
+        "content": row[2],
+    }
+    out = f"DOC_JSON: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}"
+    if len(out) > MAX_TOOL_OUTPUT_CHARS:
+        return out[:MAX_TOOL_OUTPUT_CHARS] + "...[TRUNCATED]"
+    return out
+
+
 def tool_analyze_deep(client, get_current_model, session_id: int, instruction: str):
     transcript = db.get_session_transcript(session_id, max_chars=6000)
     if not transcript:
@@ -280,4 +378,6 @@ __all__ = [
     "_safe_args",
     "tool_search_memory",
     "tool_analyze_deep",
+    "tool_list_session_files",
+    "tool_read_corpus_doc",
 ]

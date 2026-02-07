@@ -13,6 +13,7 @@ export interface Message {
   isSystem?: boolean;
   isStreaming?: boolean;
   images?: ImageAttachment[];
+  files?: FileAttachment[];
 }
 
 export enum AppMode {
@@ -37,6 +38,7 @@ export interface StoredMessage {
   created_at?: number;
   tokens?: number;
   attachments?: ImageAttachment[];
+  files?: FileAttachment[];
 }
 
 export interface ImageAttachment {
@@ -46,6 +48,16 @@ export interface ImageAttachment {
   width?: number | null;
   height?: number | null;
   size_bytes?: number | null;
+}
+
+export interface FileAttachment {
+  id: string;
+  filename: string;
+  mime?: string | null;
+  size_bytes?: number | null;
+  sha256?: string | null;
+  indexed?: boolean;
+  chunks?: number;
 }
 
 export interface LiveTranscript {
@@ -63,7 +75,8 @@ export interface SessionWindow {
 export interface NeuralSocketHook {
   status: ConnectionStatus;
   messages: Message[];
-  sendMessage: (payload: { text: string; images?: ImageAttachment[] }) => void;
+  sendMessage: (payload: { text: string; images?: ImageAttachment[]; files?: FileAttachment[] }) => void;
+  uploadFile: (file: File) => Promise<FileAttachment>;
   connect: () => void;
   disconnect: () => void;
 }
